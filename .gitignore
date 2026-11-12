@@ -1,0 +1,10 @@
+node_modules/
+dist/
+src-tauri/target/
+.env
+*.log
+
+# Tauri signing keys — NEVER commit these
+*.key
+*.key.pub
+/~/

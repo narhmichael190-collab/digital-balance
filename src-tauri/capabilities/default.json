@@ -1,0 +1,28 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-capability",
+  "description": "Permissions used by the Digital Balance desktop windows.",
+  "windows": [
+    "main",
+    "limit-warning"
+  ],
+  "permissions": [
+    "core:default",
+    "core:tray:default",
+    "core:menu:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-close",
+    "core:window:allow-set-focus",
+    "core:window:allow-set-size",
+    "core:window:allow-center",
+    "core:window:allow-set-fullscreen",
+    "opener:default",
+    "deep-link:default",
+    "autostart:default",
+    "core:app:allow-app-hide",
+    "core:app:allow-app-show",
+    "core:app:allow-exit",
+    "updater:default"
+  ]
+}
