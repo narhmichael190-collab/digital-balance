@@ -1,6 +1,6 @@
 [package]
 name = "digital-balance"
-version = "1.3.7"
+version = "1.3.8"
 description = "Digital Balance Windows productivity app"
 authors = ["Digital Balance"]
 edition = "2021"
