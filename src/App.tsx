@@ -7,6 +7,9 @@ import { check, type Update } from '@tauri-apps/plugin-updater';
 import {
   awardFocusPoints,
   ensureProfile,
+  getCurrentProfile,
+  isUsernameAvailable,
+  updateProfileUsername,
   fetchLeaderboard,
   setupDeepLinkAuth,
   signInWithGoogle,
@@ -234,6 +237,9 @@ export default function App() {
   const [focusFullscreen, setFocusFullscreen] = useState(false);
   const [update, setUpdate] = useState<Update | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
+  const [profileReady, setProfileReady] = useState(!supabaseConfigured);
+  const [needsUsername, setNeedsUsername] = useState(false);
+  const [profileDisplayName, setProfileDisplayName] = useState('');
 
   useEffect(() => { dataRef.current = data; }, [data]);
 
@@ -295,13 +301,84 @@ export default function App() {
     setUpdate(null);
   }
 
+  async function checkForUpdates() {
+    setUpdateBusy(true);
+    try {
+      const next = await check();
+      if (next) {
+        setUpdate(next);
+        setNotice(`Digital Balance ${next.version} is available.`);
+      } else {
+        setNotice('Digital Balance is up to date.');
+      }
+    } catch (error) {
+      setNotice(error instanceof Error ? `Update check failed: ${error.message}` : 'Could not check for updates.');
+    } finally {
+      setUpdateBusy(false);
+    }
+  }
+
   useEffect(() => {
     let dispose: () => void = () => undefined;
+    let alive = true;
+
+    const hydrateProfile = async (nextSession: Session | null) => {
+      if (!alive) return;
+      setSession(nextSession);
+      setUser(nextSession?.user ?? null);
+      setAuthReady(true);
+
+      if (!nextSession?.user || !supabase) {
+        setNeedsUsername(false);
+        setProfileDisplayName('');
+        setProfileReady(true);
+        return;
+      }
+
+      setProfileReady(false);
+      try {
+        await ensureProfile(nextSession.user);
+        const profile = await getCurrentProfile();
+        if (!alive) return;
+
+        const username = profile?.username?.trim() ?? '';
+        const generatedUsername = /^user_[0-9a-f]{8}$/i.test(username);
+        setNeedsUsername(!username || generatedUsername);
+
+        if (profile) {
+          const googleNames = new Set([
+            nextSession.user.user_metadata?.full_name,
+            nextSession.user.user_metadata?.name,
+            nextSession.user.email?.split('@')[0],
+            'Digital Balance user',
+            'Digital Balance User',
+          ].filter(Boolean).map((value) => String(value)));
+          const shouldSyncUsernameAsDisplay = !generatedUsername && profile.display_name !== username && googleNames.has(profile.display_name);
+          if (shouldSyncUsernameAsDisplay) {
+            try {
+              await updateProfileDisplayName(username);
+              setProfileDisplayName(username);
+            } catch {
+              setProfileDisplayName(profile.display_name || username);
+            }
+          } else {
+            setProfileDisplayName(profile.display_name || username);
+          }
+        }
+      } catch (error) {
+        console.error('Profile hydration failed', error);
+        setNeedsUsername(false);
+      } finally {
+        if (alive) setProfileReady(true);
+      }
+    };
+
     void setupDeepLinkAuth().then((cleanup) => { dispose = cleanup; });
-    if (!supabase) { setAuthReady(true); return () => dispose(); }
-    const current = supabase.auth.getSession().then(({ data: result }) => { setSession(result.session); setUser(result.session?.user ?? null); setAuthReady(true); if (result.session?.user) void ensureProfile(result.session.user).catch(() => undefined); });
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, next) => { setSession(next); setUser(next?.user ?? null); setAuthReady(true); if (next?.user) void ensureProfile(next.user).catch(() => undefined); });
-    return () => { dispose(); void current; listener.subscription.unsubscribe(); };
+    if (!supabase) { setAuthReady(true); setProfileReady(true); return () => { alive = false; dispose(); }; }
+
+    const current = supabase.auth.getSession().then(({ data: result }) => hydrateProfile(result.session));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, next) => { void hydrateProfile(next); });
+    return () => { alive = false; dispose(); void current; listener.subscription.unsubscribe(); };
   }, []);
 
   useEffect(() => {
@@ -381,7 +458,7 @@ export default function App() {
   const weekly = useMemo(() => !data ? [] : Array.from({length:7},(_,index)=>{ const date=new Date(); date.setHours(12,0,0,0); date.setDate(date.getDate()-(6-index)); const key=date.toDateString(); const rows=data.sessions.filter(s=>new Date(s.started_at).toDateString()===key); const productive=rows.filter(s=>s.category==='Productive').reduce((a,s)=>a+s.duration_secs,0); const distracting=rows.filter(s=>s.category==='Distracting').reduce((a,s)=>a+s.duration_secs,0); return {label:date.toLocaleDateString(undefined,{weekday:'short'}),productive,distracting,total:productive+distracting}; }), [data]);
   const streak = data ? focusStreak(data) : 0;
   const score = data ? scoreFor(data) : 0;
-  const displayName = data?.settings.displayName || user?.user_metadata?.name || user?.user_metadata?.full_name || user?.email?.split('@')[0] || 'Digital Balance';
+  const displayName = profileDisplayName || data?.settings.displayName || user?.user_metadata?.name || user?.user_metadata?.full_name || user?.email?.split('@')[0] || 'Digital Balance';
 
   async function refreshLeaderboard() { if (!supabase) return; try { setLeaderboard(await fetchLeaderboard()); } catch (error) { console.error(error); setNotice('Could not load the global leaderboard.'); } }
   useEffect(() => { if (view === 'Leaderboard' && user) void refreshLeaderboard(); }, [view, user]);
@@ -453,12 +530,13 @@ export default function App() {
   async function buyReward(reward:Reward){ if(!data)return; try{setData(await purchaseReward(reward.id));setNotice(`${reward.name} unlocked.`);}catch(error){setNotice(error instanceof Error?error.message:'You need more Balance Coins.');} }
   async function equip(reward:Reward){ if(!data)return; try{setData(await equipReward(reward.id));setNotice(`${reward.name} equipped.`);}catch(error){setNotice(error instanceof Error?error.message:'Could not equip that reward.');} }
   async function applyTheme(themeId:string){ if(!data)return; setThemePreview(null); setData(await saveSettings({...data.settings,theme:themeId})); setNotice(`${themeById(themeId).name} equipped.`); }
-  async function saveDisplayName(name:string){ if(!data)return; const clean=name.trim().slice(0,28); if(!clean){setNotice('Choose a display name first.');return;} setData(await saveSettings({...data.settings,displayName:clean})); if(user&&supabase){ try{await updateProfileDisplayName(clean);}catch(error){console.error(error);setNotice('Saved locally, but cloud profile update failed.');return;} } setNotice(`Identity set to ${clean}.`); }
+  async function saveDisplayName(name:string){ if(!data)return; const clean=name.trim().slice(0,28); if(!clean){setNotice('Choose a display name first.');return;} setData(await saveSettings({...data.settings,displayName:clean})); setProfileDisplayName(clean); if(user&&supabase){ try{await updateProfileDisplayName(clean);}catch(error){console.error(error);setNotice('Saved locally, but cloud profile update failed.');return;} } setNotice(`Identity set to ${clean}.`); }
 
   if(!authReady) return <Splash/>;
   if(!supabaseConfigured) return <CloudSetupScreen issue={supabaseConfigIssue ?? 'Cloud authentication is not configured.'}/>;
   if(!session) return <LoginScreen onLogin={signInWithGoogle} notice={notice}/>;
-  if(!data) return <Splash/>;
+  if(needsUsername && user) return <UsernameSetup user={user} onComplete={async(username)=>{ await updateProfileUsername(username); setProfileDisplayName(username); if(data) setData({...data,settings:{...data.settings,displayName:username}}); setNeedsUsername(false); setNotice(`Welcome, ${username}.`); }} />;
+  if(!profileReady || !data) return <Splash/>;
 
   const appName=data.current_app ?? 'No foreground app';
   const currentLimit=data.current_exe?data.settings.appLimits[data.current_exe]:undefined;
@@ -485,11 +563,11 @@ export default function App() {
       {view==='Control'&&<ControlPage data={data} topApps={appOptions} onSaveLimit={saveLimit} onRemoveLimit={removeLimit} focusApps={focusApps} setFocusApps={setFocusApps}/>} 
       {view==='Rewards'&&<RewardsPage data={data} rewards={rewards} filter={shopFilter} setFilter={setShopFilter} search={themeSearch} setSearch={setThemeSearch} preview={themePreview} onPreview={setThemePreview} onBuy={buyReward} onEquip={equip} onApplyTheme={applyTheme} onResetPreview={()=>setThemePreview(null)}/>} 
       {view==='Leaderboard'&&<Leaderboard data={leaderboard} userId={user?.id ?? ''} refresh={refreshLeaderboard}/>} 
-      {view==='Settings'&&<SettingsPage data={data} setData={setData} user={user} onSaveDisplayName={saveDisplayName}/>} 
+      {view==='Settings'&&<SettingsPage data={data} setData={setData} user={user} onSaveDisplayName={saveDisplayName} onCheckForUpdates={checkForUpdates} updateCheckBusy={updateBusy}/>} 
     </main>
 
     {paletteOpen&&<CommandPalette onClose={()=>setPaletteOpen(false)} onGo={go} onStartFocus={()=>{setPaletteOpen(false);setView('Focus');void startFocus();}}/>}
-    {closePrompt&&<ClosePrompt onBackground={async()=>{setClosePrompt(false);try{await hideToTray();}catch(error){setNotice(error instanceof Error?error.message:'Could not move Digital Balance to the system tray.');}}} onQuit={async()=>{setClosePrompt(false);try{await quitApp();}catch(error){setNotice(error instanceof Error?error.message:'Could not close Digital Balance.');}}}/>}
+    {closePrompt&&<ClosePrompt onBackground={async()=>{setClosePrompt(false);try{await hideToTray();}catch(error){setNotice(error instanceof Error?error.message:'Could not move Digital Balance to the system tray.');}}} onQuit={async()=>{setClosePrompt(false);allowCloseRef.current=true;try{await quitApp();}catch(error){setNotice(error instanceof Error?error.message:'Could not close Digital Balance.');}}}/>}
 
   </div>;
 }
@@ -497,6 +575,34 @@ export default function App() {
 function todayForExe(data:TrackerData,exe:string){const key=new Date().toDateString();let total=data.sessions.filter(s=>s.exe===exe&&new Date(s.started_at).toDateString()===key).reduce((a,s)=>a+s.duration_secs,0);if(data.current_exe===exe)total+=data.current_session_secs;return total;}
 function Splash(){return <div className="splash"><div className="loader-orbit"/><strong>Starting Digital Balance</strong><span>Bringing the tracker online…</span></div>;}
 function CloudSetupScreen({issue}:{issue:string}){return <div className="login-screen"><div className="login-card"><BrandMark big /><div className="eyebrow">Cloud setup needed</div><h1>One last connection.</h1><p>Digital Balance requires its Supabase connection before anyone can use the account and global leaderboard.</p><div className="setup-error"><strong>{issue}</strong><code>Create <b>.env</b> beside package.json with VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY.</code></div><button className="primary-btn wide" onClick={()=>window.location.reload()}>Retry connection</button></div></div>;}
+function UsernameSetup({user,onComplete}:{user:User;onComplete:(username:string)=>Promise<void>}){
+  const [value,setValue]=useState('');
+  const [status,setStatus]=useState<'idle'|'checking'|'available'|'taken'|'invalid'|'error'>('idle');
+  const [message,setMessage]=useState('Choose a unique username for Digital Balance.');
+  const [busy,setBusy]=useState(false);
+
+  useEffect(()=>{
+    const clean=value.trim().toLowerCase();
+    if(!clean){setStatus('idle');setMessage('Choose a unique username for Digital Balance.');return;}
+    if(!/^[a-z0-9_]{3,20}$/.test(clean)){setStatus('invalid');setMessage('Use 3–20 lowercase letters, numbers, or underscores.');return;}
+    setStatus('checking');setMessage('Checking availability…');
+    const id=window.setTimeout(()=>{
+      void isUsernameAvailable(clean).then(ok=>{setStatus(ok?'available':'taken');setMessage(ok?'Username available.':'That username is already taken.');}).catch(()=>{setStatus('error');setMessage('Could not check availability right now.');});
+    },320);
+    return ()=>window.clearTimeout(id);
+  },[value]);
+
+  const canContinue=status==='available'&&!busy;
+  const submit=async()=>{
+    if(!canContinue)return;
+    setBusy(true);
+    try{await onComplete(value.trim().toLowerCase());}
+    catch(error){setStatus('error');setMessage(error instanceof Error?error.message:'Could not save that username.');}
+    finally{setBusy(false);}
+  };
+
+  return <div className="login-screen username-screen"><div className="login-card username-card"><BrandMark big/><div className="eyebrow">One-time setup</div><h1>Choose your username.</h1><p>This is the name Digital Balance will use for your profile and leaderboard identity.</p><label className="field"><span>Username</span><input autoFocus maxLength={20} value={value} onChange={e=>setValue(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g,''))} onKeyDown={e=>{if(e.key==='Enter')void submit()}} placeholder="your_username"/></label><div className={`username-status ${status}`}><span className="status-dot"/>{message}</div><button className="primary-btn wide" disabled={!canContinue} onClick={()=>void submit()}>{busy?'Saving…':'Continue'}</button><div className="privacy-note">Signed in as {user.email ?? 'your Google account'}.</div></div></div>;}
+
 function LoginScreen({onLogin,notice}:{onLogin:()=>Promise<void>;notice:string}){return <div className="login-screen"><div className="login-card"><BrandMark big /><div className="eyebrow">Digital Balance</div><h1>A smarter relationship with your screen.</h1><p>Track Windows usage, set real limits, earn rewards, run Focus, and compare progress without sending detailed activity to the cloud.</p><button className="google-btn" onClick={()=>void onLogin()}><span>G</span> Continue with Google</button><div className="privacy-note">Detailed activity remains local. Only the minimum leaderboard data is synchronized.</div>{notice&&<div className="login-error">{notice}</div>}</div></div>;}
 
 function Overview({data,score,today,topApps,streak,onStartFocus,onGo,currentRemaining,appName}:{data:TrackerData;score:number;today:{tracked:number;productive:number;distracting:number;focus:number};topApps:{name:string;exe:string;category:Category;secs:number}[];streak:number;onStartFocus:()=>void;onGo:(view:View)=>void;currentRemaining:number|null;appName:string}){const progress=Math.min(100,(today.focus/Math.max(1,data.settings.dailyFocusTargetMinutes))*100);return <div className="content-grid"><section className="hero-grid"><div className="hero-card hero-main"><span className="section-label">DIGITAL BALANCE SCORE</span><div className="hero-title-row"><div><h2>{score>=80?'Locked in.':score>=60?'Good momentum.':'Time to reset.'}</h2><p>Your score combines focus, productive time and distraction control — not just raw screen time.</p><div className="hero-actions"><button className="primary-btn" onClick={onStartFocus}>Start Focus</button><button className="ghost-btn" onClick={()=>onGo('Control')}>Tune limits</button></div></div><div className="score-ring" style={{'--score':`${score}%`} as CSSProperties}><span>{score}</span></div></div></div><div className="stat-card"><span>Tracked today</span><strong>{time(today.tracked)}</strong><small>{minutes(today.productive)}m productive · {minutes(today.distracting)}m distracting</small></div><div className="stat-card"><span>Focus streak</span><strong>{streak}d</strong><small>{streak>0?'Keep the run alive.':'Complete a Focus session today.'}</small></div></section><section className="live-grid"><div className="panel live-panel"><div className="panel-head"><div><span className="section-label">ACTIVE NOW</span><h3>{appName}</h3></div><span className={`live-chip ${data.tracking_paused?'off':''}`}>{data.tracking_paused?'Paused':'Live'}</span></div><div className="live-meta"><span>{data.current_category ?? 'Neutral'}</span><span>{time(data.current_session_secs)} current session</span>{currentRemaining!==null&&<span>{currentRemaining}m left on protection</span>}</div><div className="signal">{[1,2,3,4,5].map(i=><i key={i}/>)}</div></div><div className="panel focus-goal"><span className="section-label">TODAY'S FOCUS</span><strong>{today.focus} / {data.settings.dailyFocusTargetMinutes}m</strong><p>Complete the target to strengthen your Balance score and earn Coins.</p><div className="progress"><span style={{width:`${progress}%`}}/></div></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">USAGE</span><h3>Most-used apps</h3></div><button className="text-btn" onClick={()=>onGo('Insights')}>Open insights →</button></div><div className="app-list">{topApps.length?topApps.slice(0,8).map(app=><div className="app-row" key={app.exe}><div className="app-name"><span className={`category-dot ${app.category.toLowerCase()}`}/><div><strong title={app.exe}>{app.name}</strong><small>{app.category}</small></div></div><div className="app-bar"><span style={{width:`${Math.max(3,(app.secs/topApps[0].secs)*100)}%`}}/></div><strong className="app-time">{time(app.secs)}</strong></div>):<div className="empty">Use the computer for a bit and your real app history will appear here.</div>}</div></section><section className="momentum-strip"><div><span className="section-label">MOMENTUM</span><strong>{today.distracting<=data.settings.dailyDistractionLimitMinutes*60?'Within distraction limit':'Over your distraction target'}</strong><small>Digital Balance updates this in the background while you work.</small></div><button className="ghost-btn" onClick={()=>onGo('Rewards')}>Open Reward Lab</button></section></div>;}
@@ -547,12 +653,12 @@ function RewardsPage({data,rewards:catalog,filter,setFilter,search,setSearch,pre
 
 function Leaderboard({data,userId,refresh}:{data:LeaderboardRow[];userId:string;refresh:()=>Promise<void>}){return <div className="leaderboard-layout"><section className="panel leader-main"><div className="panel-head"><div><span className="section-label">GLOBAL</span><h3>People building better habits</h3></div><button className="ghost-btn small" onClick={()=>void refresh()}>Refresh</button></div>{data.length?data.slice(0,25).map((row,index)=><div className={`leader-row ${row.user_id===userId?'me':''}`} key={row.user_id}><span className="rank-badge">{String(index+1).padStart(2,'0')}</span><div className="leader-avatar">{row.display_name.slice(0,1).toUpperCase()}</div><div><strong>{row.display_name}</strong><small>{row.user_id===userId?'You':'Digital Balance member'}</small></div><b>{row.total_points.toLocaleString()}</b></div>):<div className="empty">No leaderboard rows yet.</div>}</section><section className="panel leaderboard-side"><span className="section-label">YOUR RANKING</span><div className="big-score">{data.find(r=>r.user_id===userId)?.total_points??0}</div><p>Leaderboard points and Balance Coins are intentionally separate, so shopping never lowers your rank.</p></section></div>;}
 
-function SettingsPage({data,setData,user,onSaveDisplayName}:{data:TrackerData;setData:(data:TrackerData)=>void;user:User|null;onSaveDisplayName:(name:string)=>Promise<void>}){
+function SettingsPage({data,setData,user,onSaveDisplayName,onCheckForUpdates,updateCheckBusy}:{data:TrackerData;setData:(data:TrackerData)=>void;user:User|null;onSaveDisplayName:(name:string)=>Promise<void>;onCheckForUpdates:()=>Promise<void>;updateCheckBusy:boolean}){
   const [busy,setBusy]=useState(false); const [name,setName]=useState(data.settings.displayName||user?.user_metadata?.name||user?.email?.split('@')[0]||'Digital Balance');
   useEffect(()=>{setName(data.settings.displayName||user?.user_metadata?.name||user?.email?.split('@')[0]||'Digital Balance');},[data.settings.displayName]);
   async function update(patch:Partial<AppSettings>){setBusy(true);try{setData(await saveSettings({...data.settings,...patch}));}finally{setBusy(false);}}
   const knownApps=[...new Set(data.sessions.map(s=>s.exe))].filter(isProtectedCandidate).sort().slice(0,40);
-  return <div className="settings-grid"><section className="panel"><div className="panel-head"><div><span className="section-label">IDENTITY</span><h3>Make the profile yours</h3></div></div><label className="field"><span>Display name</span><input maxLength={28} value={name} onChange={e=>setName(e.target.value)}/></label><div className="name-actions"><button className="primary-btn" onClick={()=>void onSaveDisplayName(name)}>Save name</button><button className="ghost-btn" onClick={()=>{const n=randomName();setName(n);void onSaveDisplayName(n)}}>Random name</button></div><div className="preset-names">{AESTHETIC_NAMES.slice(0,8).map(n=><button key={n} onClick={()=>{setName(n);void onSaveDisplayName(n)}}>{n}</button>)}</div></section><section className="panel"><div className="panel-head"><div><span className="section-label">BEHAVIOR</span><h3>Daily rules</h3></div>{busy&&<span className="mini-pill">Saving…</span>}</div><label className="field"><span>Distraction limit (minutes)</span><input type="number" min="1" value={data.settings.dailyDistractionLimitMinutes} onChange={e=>void update({dailyDistractionLimitMinutes:Math.max(1,Math.floor(Number(e.target.value)||1))})}/></label><label className="field"><span>Focus target (minutes)</span><input type="number" min="1" value={data.settings.dailyFocusTargetMinutes} onChange={e=>void update({dailyFocusTargetMinutes:Math.max(1,Math.floor(Number(e.target.value)||1))})}/></label><label className="field"><span>Idle threshold (seconds)</span><input type="number" min="15" value={data.settings.idleThresholdSeconds} onChange={e=>void update({idleThresholdSeconds:Math.max(15,Math.floor(Number(e.target.value)||15))})}/></label><div className="setting-toggle"><div><strong>Notifications</strong><small>Allow Digital Balance nudges.</small></div><button className={`toggle ${data.settings.notificationsEnabled?'on':''}`} onClick={()=>void update({notificationsEnabled:!data.settings.notificationsEnabled})}><span/></button></div><div className="setting-toggle"><div><strong>Motivational nudges</strong><small>Occasional firm reminders when distraction runs long.</small></div><button className={`toggle ${data.settings.motivationalNudges?'on':''}`} onClick={()=>void update({motivationalNudges:!data.settings.motivationalNudges})}><span/></button></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">WINDOWS</span><h3>Integration</h3></div></div><div className="setting-toggle"><div><strong>Start with Windows</strong><small>Launch the tracker when you sign in.</small></div><button className={`toggle ${data.settings.autostartEnabled?'on':''}`} onClick={()=>void update({autostartEnabled:!data.settings.autostartEnabled})}><span/></button></div><div className="setting-toggle"><div><strong>Ask before closing</strong><small>Offer to keep Digital Balance running quietly in the tray.</small></div><button className={`toggle ${data.settings.closeToTray?'on':''}`} onClick={()=>void update({closeToTray:!data.settings.closeToTray})}><span/></button></div><div className="setting-toggle"><div><strong>Deep Focus auto-block</strong><small>Enforce your Focus blocklist when Deep Focus starts.</small></div><button className={`toggle ${data.settings.deepFocusAutoBlock?'on':''}`} onClick={()=>void update({deepFocusAutoBlock:!data.settings.deepFocusAutoBlock})}><span/></button></div><button className="danger-btn" onClick={async()=>{if(window.confirm('Delete all local Digital Balance activity?'))setData(await deleteLocalData())}}>Delete local activity</button><button className="ghost-btn full" onClick={async()=>{await navigator.clipboard.writeText(await exportLocalData())}}>Copy privacy export JSON</button></section><section className="panel full-width"><div className="panel-head"><div><span className="section-label">CATEGORIES</span><h3>Teach Digital Balance your apps</h3></div><small>Digital Balance and Windows system processes are excluded.</small></div>{knownApps.length?knownApps.map(exe=>{const current=data.settings.categoryOverrides[exe]??data.sessions.find(s=>s.exe===exe)?.category??'Neutral';return <div className="category-row" key={exe}><span>{exe}</span><SmartSelect value={current} onChange={v=>void saveCategory(exe,v).then(setData)} options={categories.map(c=>({value:c,label:c}))} ariaLabel={`Category for ${exe}`}/></div>}):<div className="empty">Use the computer for a bit and app categories will appear here.</div>}</section></div>;}
+  return <div className="settings-grid"><section className="panel"><div className="panel-head"><div><span className="section-label">IDENTITY</span><h3>Make the profile yours</h3></div></div><label className="field"><span>Display name</span><input maxLength={28} value={name} onChange={e=>setName(e.target.value)}/></label><div className="name-actions"><button className="primary-btn" onClick={()=>void onSaveDisplayName(name)}>Save name</button><button className="ghost-btn" onClick={()=>{const n=randomName();setName(n);void onSaveDisplayName(n)}}>Random name</button></div><div className="preset-names">{AESTHETIC_NAMES.slice(0,8).map(n=><button key={n} onClick={()=>{setName(n);void onSaveDisplayName(n)}}>{n}</button>)}</div></section><section className="panel"><div className="panel-head"><div><span className="section-label">BEHAVIOR</span><h3>Daily rules</h3></div>{busy&&<span className="mini-pill">Saving…</span>}</div><label className="field"><span>Distraction limit (minutes)</span><input type="number" min="1" value={data.settings.dailyDistractionLimitMinutes} onChange={e=>void update({dailyDistractionLimitMinutes:Math.max(1,Math.floor(Number(e.target.value)||1))})}/></label><label className="field"><span>Focus target (minutes)</span><input type="number" min="1" value={data.settings.dailyFocusTargetMinutes} onChange={e=>void update({dailyFocusTargetMinutes:Math.max(1,Math.floor(Number(e.target.value)||1))})}/></label><label className="field"><span>Idle threshold (seconds)</span><input type="number" min="15" value={data.settings.idleThresholdSeconds} onChange={e=>void update({idleThresholdSeconds:Math.max(15,Math.floor(Number(e.target.value)||15))})}/></label><div className="setting-toggle"><div><strong>Notifications</strong><small>Allow Digital Balance nudges.</small></div><button className={`toggle ${data.settings.notificationsEnabled?'on':''}`} onClick={()=>void update({notificationsEnabled:!data.settings.notificationsEnabled})}><span/></button></div><div className="setting-toggle"><div><strong>Motivational nudges</strong><small>Occasional firm reminders when distraction runs long.</small></div><button className={`toggle ${data.settings.motivationalNudges?'on':''}`} onClick={()=>void update({motivationalNudges:!data.settings.motivationalNudges})}><span/></button></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">WINDOWS</span><h3>Integration</h3></div></div><div className="setting-toggle"><div><strong>Start with Windows</strong><small>Launch the tracker when you sign in.</small></div><button className={`toggle ${data.settings.autostartEnabled?'on':''}`} onClick={()=>void update({autostartEnabled:!data.settings.autostartEnabled})}><span/></button></div><div className="setting-toggle"><div><strong>Ask before closing</strong><small>Offer to keep Digital Balance running quietly in the tray.</small></div><button className={`toggle ${data.settings.closeToTray?'on':''}`} onClick={()=>void update({closeToTray:!data.settings.closeToTray})}><span/></button></div><div className="setting-toggle"><div><strong>Deep Focus auto-block</strong><small>Enforce your Focus blocklist when Deep Focus starts.</small></div><button className={`toggle ${data.settings.deepFocusAutoBlock?'on':''}`} onClick={()=>void update({deepFocusAutoBlock:!data.settings.deepFocusAutoBlock})}><span/></button></div><div className="setting-toggle"><div><strong>Updates</strong><small>Check GitHub for a newer Digital Balance release.</small></div><button className="ghost-btn" onClick={()=>void onCheckForUpdates()} disabled={updateCheckBusy}>{updateCheckBusy?'Checking…':'Check for updates'}</button></div><button className="danger-btn" onClick={async()=>{if(window.confirm('Delete all local Digital Balance activity?'))setData(await deleteLocalData())}}>Delete local activity</button><button className="ghost-btn full" onClick={async()=>{await navigator.clipboard.writeText(await exportLocalData())}}>Copy privacy export JSON</button></section><section className="panel full-width"><div className="panel-head"><div><span className="section-label">CATEGORIES</span><h3>Teach Digital Balance your apps</h3></div><small>Digital Balance and Windows system processes are excluded.</small></div>{knownApps.length?knownApps.map(exe=>{const current=data.settings.categoryOverrides[exe]??data.sessions.find(s=>s.exe===exe)?.category??'Neutral';return <div className="category-row" key={exe}><span>{exe}</span><SmartSelect value={current} onChange={v=>void saveCategory(exe,v).then(setData)} options={categories.map(c=>({value:c,label:c}))} ariaLabel={`Category for ${exe}`}/></div>}):<div className="empty">Use the computer for a bit and app categories will appear here.</div>}</section></div>;}
 
 function CommandPalette({onClose,onGo,onStartFocus}:{onClose:()=>void;onGo:(v:View)=>void;onStartFocus:()=>void}){const actions:[string,View|'focus'][]=[['Open Overview','Overview'],['Open Focus','Focus'],['Open Insights','Insights'],['Open Control Center','Control'],['Open Rewards','Rewards'],['Open Leaderboard','Leaderboard'],['Open Settings','Settings'],['Start Focus now','focus']];return <div className="palette-backdrop" onClick={onClose}><div className="palette" onClick={e=>e.stopPropagation()}><div className="palette-input"><span>⌕</span><input autoFocus placeholder="Jump to a feature…"/></div>{actions.map(([label,target])=><button key={label} onClick={()=>target==='focus'?onStartFocus():onGo(target)}><span>{label}</span><kbd>↵</kbd></button>)}</div></div>;}
 function ClosePrompt({onBackground,onQuit}:{onBackground:()=>Promise<void>;onQuit:()=>Promise<void>}){return <div className="modal-backdrop"><div className="close-card"><BrandMark /><span className="section-label">KEEP DIGITAL BALANCE WORKING</span><h2>Run quietly in the background?</h2><p>Closing the window does not have to stop tracking. Digital Balance can hide to the system tray and keep the monitor event-driven with a lightweight periodic check.</p><div className="close-actions"><button className="primary-btn" onClick={()=>void onBackground()}>Keep running in background</button><button className="ghost-btn" onClick={()=>void onQuit()}>Close completely</button></div></div></div>}

@@ -67,3 +67,6 @@ revoke all on function public.ensure_profile(text) from public;
 grant execute on function public.ensure_profile(text) to authenticated;
 revoke all on function public.award_focus_points(integer) from public;
 grant execute on function public.award_focus_points(integer) to authenticated;
+
+
+create unique index if not exists profiles_username_lower_idx on public.profiles (lower(username));

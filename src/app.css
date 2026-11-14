@@ -76,3 +76,14 @@ h1,h2,h3,.hero-title-row strong,.section-label{font-family:var(--display-font)}
 @media(max-width:1250px){.app-row{grid-template-columns:minmax(130px,175px) minmax(90px,1fr) 62px;gap:8px}}
 
 .update-banner{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 0 14px;padding:14px 16px;border:1px solid color-mix(in srgb,var(--accent) 35%,var(--line));background:linear-gradient(110deg,color-mix(in srgb,var(--accent) 10%,var(--panel)),color-mix(in srgb,var(--accent2) 7%,var(--panel2)));border-radius:14px;box-shadow:0 12px 28px rgba(0,0,0,.16);animation:slideIn .28s ease}.update-banner>div:first-child{display:grid;gap:4px}.update-banner strong{font-size:13px;color:var(--text)}.update-banner small{font-size:10px;color:var(--muted)}.update-actions{display:flex;gap:8px;flex-shrink:0}.update-banner button:disabled{opacity:.6;cursor:wait}@keyframes slideIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
+
+
+/* V1.3.9 fixes */
+.limit-builder{grid-template-columns:minmax(170px,1.35fr) minmax(96px,110px) minmax(116px,128px) minmax(116px,128px) auto}
+.limit-builder input[type=number]{min-width:86px;width:100%;box-sizing:border-box;text-align:center}
+.limit-builder select{min-width:108px;width:100%;box-sizing:border-box}
+@media(max-width:1250px){.limit-builder{grid-template-columns:minmax(155px,1.2fr) 102px 112px auto}.limit-builder input[type=number]{min-width:84px}.limit-builder select{min-width:102px}}
+.username-card{width:min(540px,calc(100vw - 40px))}.username-screen .login-card p{max-width:430px}.username-status{display:flex;align-items:center;gap:8px;min-height:30px;margin-top:9px;font-size:10px;color:var(--muted)}.username-status .status-dot{width:7px;height:7px;border-radius:50%;background:#64748b;box-shadow:0 0 0 3px color-mix(in srgb,#64748b 12%,transparent)}.username-status.available{color:#77e4a9}.username-status.available .status-dot{background:#4ade80;box-shadow:0 0 0 3px rgba(74,222,128,.12)}.username-status.taken,.username-status.invalid,.username-status.error{color:#fb8c8c}.username-status.taken .status-dot,.username-status.invalid .status-dot,.username-status.error .status-dot{background:#f87171;box-shadow:0 0 0 3px rgba(248,113,113,.12)}.username-status.checking{color:#93c5fd}.username-status.checking .status-dot{background:#60a5fa;animation:usernamePulse 1s ease-in-out infinite}@keyframes usernamePulse{50%{opacity:.35;transform:scale(.75)}}
+
+/* V1.3.9 updater feedback */
+.update-status{display:block;color:var(--accent);font-size:9px;line-height:1.45;margin-top:5px;max-width:440px}.update-status:has(+ *){display:block}

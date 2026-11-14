@@ -67,6 +67,16 @@ export async function setupDeepLinkAuth() {
   return unlisten;
 }
 
+export type Profile = {
+  id: string;
+  username: string;
+  display_name: string;
+  points?: number;
+  streak?: number;
+  created_at?: string;
+  updated_at?: string;
+};
+
 export async function ensureProfile(user: User) {
   if (!supabase) return;
   const { data: existing, error: readError } = await supabase
@@ -76,6 +86,7 @@ export async function ensureProfile(user: User) {
     .maybeSingle();
   if (readError) throw readError;
   if (existing) return;
+
   const displayName = user.user_metadata?.full_name || user.user_metadata?.name || user.email?.split('@')[0] || 'Digital Balance user';
   const { error } = await supabase.from('profiles').insert({
     id: user.id,
@@ -83,6 +94,63 @@ export async function ensureProfile(user: User) {
     display_name: displayName,
   });
   if (error) throw error;
+}
+
+export async function getCurrentProfile(): Promise<Profile | null> {
+  if (!supabase) return null;
+  const { data: auth } = await supabase.auth.getUser();
+  if (!auth.user) return null;
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('id, username, display_name, points, streak, created_at, updated_at')
+    .eq('id', auth.user.id)
+    .maybeSingle();
+  if (error) throw error;
+  return data as Profile | null;
+}
+
+export async function isUsernameAvailable(username: string) {
+  if (!supabase) return false;
+  const clean = username.trim().toLowerCase();
+  if (!/^[a-z0-9_]{3,20}$/.test(clean)) return false;
+  const { data: auth } = await supabase.auth.getUser();
+  if (!auth.user) return false;
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('id')
+    .ilike('username', clean)
+    .neq('id', auth.user.id)
+    .limit(1);
+
+  if (error) throw error;
+  return (data?.length ?? 0) === 0;
+}
+
+export async function updateProfileUsername(username: string) {
+  if (!supabase) throw new Error('Supabase is not configured yet.');
+  const clean = username.trim().toLowerCase();
+
+  if (!/^[a-z0-9_]{3,20}$/.test(clean)) {
+    throw new Error('Username must be 3–20 characters using lowercase letters, numbers, or underscores.');
+  }
+
+  const { data: auth } = await supabase.auth.getUser();
+  if (!auth.user) throw new Error('You are not signed in.');
+
+  const { error } = await supabase
+    .from('profiles')
+    .update({
+      username: clean,
+      display_name: clean,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', auth.user.id);
+
+  if (error) {
+    if (error.code === '23505') throw new Error('That username is already taken.');
+    throw error;
+  }
 }
 
 export async function updateProfileDisplayName(displayName: string) {

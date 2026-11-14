@@ -3,7 +3,7 @@
 use chrono::{DateTime, Local, Utc};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, HashSet}, fs, path::PathBuf, process::Command, sync::{Arc, Mutex}, thread, time::Duration};
+use std::{collections::{HashMap, HashSet}, fs, path::PathBuf, sync::{Arc, Mutex}, thread, time::Duration};
 use tauri::{
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder,
     menu::{MenuBuilder, MenuItemBuilder},
@@ -348,7 +348,37 @@ impl Tracker {
     }
     fn close_pid(&mut self, pid: u32, exe: &str, reason: &str) {
         if !safe_exe(exe) { return; }
-        let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F", "/T"]).status();
+
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::CloseHandle;
+            use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
+            unsafe {
+                match OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                    Ok(handle) => {
+                        if let Err(error) = TerminateProcess(handle, 1) {
+                            eprintln!("Failed to terminate pid {pid} ({exe}): {error:?}");
+                        }
+                        let _ = CloseHandle(handle);
+                    }
+                    Err(error) => eprintln!("Failed to open pid {pid} ({exe}) for termination: {error:?}"),
+                }
+            }
+
+            for _ in 0..10 {
+                if !process_exists(pid) { break; }
+                thread::sleep(Duration::from_millis(50));
+            }
+            if process_exists(pid) {
+                eprintln!("Digital Balance could not confirm that pid {pid} ({exe}) exited.");
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
+        }
+
         let (used, limit) = self.data.settings.appLimits.get(exe).map(|rule| (self.usage_for_rule(exe, rule), u64::from(rule.dailyMinutes).saturating_mul(60))).unwrap_or((0,0));
         self.emit_limit(exe.to_string(), exe.to_string(), reason.to_string(), used, limit);
         self.finish_active();
