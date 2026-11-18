@@ -87,7 +87,7 @@ export async function ensureProfile(user: User) {
   if (readError) throw readError;
   if (existing) return;
 
-  const displayName = user.user_metadata?.full_name || user.user_metadata?.name || user.email?.split('@')[0] || 'Digital Balance user';
+  const displayName = user.user_metadata?.full_name || user.user_metadata?.name || user.email?.split('@')[0] || 'Liba Bilancia user';
   const { error } = await supabase.from('profiles').insert({
     id: user.id,
     username: `user_${user.id.replaceAll('-', '').slice(0, 8)}`,
@@ -151,6 +151,21 @@ export async function updateProfileUsername(username: string) {
     if (error.code === '23505') throw new Error('That username is already taken.');
     throw error;
   }
+}
+
+
+export type ActivityRewardResult = { points: number; coins: number; claimed: boolean };
+
+export async function claimActivityReward(action: 'daily_checkin' | 'daily_focus_goal' | 'three_focus_sessions' | 'weekly_consistency'): Promise<ActivityRewardResult> {
+  if (!supabase) return { points: 0, coins: 0, claimed: false };
+  const { data, error } = await supabase.rpc('claim_activity_reward', { p_action: action });
+  if (error) throw error;
+  const row = (data ?? {}) as Record<string, unknown>;
+  return {
+    points: Number(row.points ?? 0),
+    coins: Number(row.coins ?? 0),
+    claimed: Boolean(row.claimed),
+  };
 }
 
 export async function updateProfileDisplayName(displayName: string) {
