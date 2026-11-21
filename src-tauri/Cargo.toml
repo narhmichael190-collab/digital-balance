@@ -1,6 +1,6 @@
 [package]
 name = "digital-balance"
-version = "1.4.1"
+version = "1.4.2"
 description = "Liba Bilancia Windows productivity app"
 authors = ["Liba Bilancia"]
 edition = "2021"
