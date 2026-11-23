@@ -1,6 +1,6 @@
 {
   "name": "digital-balance",
-  "version": "1.4.6",
+  "version": "1.4.7",
   "private": true,
   "type": "module",
   "scripts": {
@@ -29,3 +29,4 @@
     "vite": "^7.0.0"
   }
 }
+
