@@ -1,0 +1,48 @@
+name: Release Liba Bilancia
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create environment file
+        shell: pwsh
+        run: |
+          "VITE_SUPABASE_URL=${{ secrets.VITE_SUPABASE_URL }}" | Out-File -FilePath .env -Encoding utf8
+          "VITE_SUPABASE_PUBLISHABLE_KEY=${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}" | Out-File -FilePath .env -Encoding utf8 -Append
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0.6.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Liba Bilancia ${{ github.ref_name }}
+          releaseBody: Automated Liba Bilancia release.
+          releaseDraft: false
+          prerelease: false
+          updaterJsonPreferNsis: true
