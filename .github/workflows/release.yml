@@ -50,7 +50,22 @@ jobs:
       - name: Install Minisign verifier
         shell: pwsh
         run: |
-          cargo install minisign --version 0.2.1 --locked
+          $version = "0.12"
+          $url = "https://github.com/jedisct1/minisign/releases/download/$version/minisign-$version-win64.zip"
+          $zip = "$env:RUNNER_TEMP\minisign.zip"
+          $dir = "$env:RUNNER_TEMP\minisign"
+
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+
+          $exe = Get-ChildItem $dir -Recurse -Filter "minisign.exe" |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "Could not find minisign.exe after extraction."
+          }
+
+          "MINISIGN_PATH=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8
 
       - name: Verify generated updater signature
         shell: pwsh
@@ -79,6 +94,10 @@ jobs:
           Write-Host "Installer: $($exe.FullName)"
           Write-Host "Signature: $($sig.FullName)"
 
-          minisign -Vm $exe.FullName `
+          & $env:MINISIGN_PATH -Vm $exe.FullName `
             -P $publicKey `
             -x $sig.FullName
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Minisign verification failed with exit code $LASTEXITCODE."
+          }
