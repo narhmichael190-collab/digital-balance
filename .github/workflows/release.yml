@@ -72,15 +72,51 @@ jobs:
       - name: Derive public key from GitHub private key
         shell: pwsh
         run: |
+          $secretValue = $env:TAURI_SIGNING_PRIVATE_KEY.Trim()
+
           $secretKeyFile = "$env:RUNNER_TEMP\tauri-signing.key"
           $derivedPublicKey = "$env:RUNNER_TEMP\derived.pub"
 
-          # Write the GitHub secret to a temporary runner-only file.
-          [IO.File]::WriteAllText(
-            $secretKeyFile,
-            $env:TAURI_SIGNING_PRIVATE_KEY
-          )
+          Write-Host "Preparing Minisign secret-key file..."
 
+          # Tauri signing secrets may be stored either as raw
+          # Minisign text or as base64-encoded key data.
+          if ($secretValue.StartsWith("untrusted comment:")) {
+            Write-Host "Detected raw Minisign key format."
+
+            [IO.File]::WriteAllText(
+              $secretKeyFile,
+              $secretValue + [Environment]::NewLine
+            )
+          }
+          else {
+            Write-Host "Detected encoded key format. Decoding..."
+
+            try {
+              $cleanBase64 = $secretValue -replace '\s', ''
+              $decodedBytes = [Convert]::FromBase64String($cleanBase64)
+
+              [IO.File]::WriteAllBytes(
+                $secretKeyFile,
+                $decodedBytes
+              )
+            }
+            catch {
+              throw "The GitHub signing secret is neither raw Minisign text nor valid base64."
+            }
+          }
+
+          # Confirm that the decoded file looks like a Minisign key.
+          $firstLine = Get-Content $secretKeyFile -TotalCount 1
+
+          if (-not $firstLine.StartsWith("untrusted comment:")) {
+            Remove-Item $secretKeyFile -Force -ErrorAction SilentlyContinue
+            throw "Decoded signing secret does not contain a valid Minisign key header."
+          }
+
+          Write-Host "Minisign secret-key format looks valid."
+
+          # Recreate the public key from the private key.
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = $env:MINISIGN_PATH
           $psi.Arguments = "-R -f -s `"$secretKeyFile`" -p `"$derivedPublicKey`""
@@ -95,7 +131,8 @@ jobs:
 
           [void]$process.Start()
 
-          # Supply the password through stdin; never put it in the command line.
+          # Supply the password through stdin.
+          # The password is never printed or placed in the command line.
           $process.StandardInput.WriteLine(
             $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD
           )
@@ -109,46 +146,68 @@ jobs:
           if ($process.ExitCode -ne 0) {
             Write-Host $stdout
             Write-Host $stderr
+
+            Remove-Item $secretKeyFile -Force -ErrorAction SilentlyContinue
+
             throw "Could not derive the public key from the GitHub private key."
           }
 
           if (-not (Test-Path $derivedPublicKey)) {
+            Remove-Item $secretKeyFile -Force -ErrorAction SilentlyContinue
             throw "Minisign did not create the derived public key."
           }
 
+          Write-Host ""
           Write-Host "========================================"
           Write-Host "PUBLIC KEY DERIVED FROM GITHUB SECRET"
           Write-Host "========================================"
           Get-Content $derivedPublicKey
+          Write-Host "========================================"
+          Write-Host ""
 
-          # Remove the temporary private-key file after use.
+          # Remove the temporary private-key file immediately.
           Remove-Item $secretKeyFile -Force -ErrorAction SilentlyContinue
 
       - name: Diagnose updater signing key and installer
         shell: pwsh
         run: |
           $config = Get-Content "src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json
-          $publicKeyBase64 = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdEMkNCODIxQTlFNTgxQ0EKUldUS2dlV3BJYmdzZlZob2ZVaFB0T1l2OVNhYmtjTUZIV2puSHRIZTR4QUlQUkhjUVI4OXVWSDUK"
+
+          # Historical public key from the v1.3.7 updater configuration.
+          # This is intentionally NOT replaced with the derived key.
+          # We need to determine whether the current GitHub private key
+          # matches one of the historical public keys.
+          $publicKeyBase64 = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaW5nIHB1YmxpYyBrZXk6IDdEMkNCODIxQTlFNTgxQ0EKUldUS2dlV3BJYmdzZlZob2ZVaFB0T1l2OVNhYmtjTUZIV2puSHRIZTR4QUlQUkhjUVI4OXVWSDUK"
 
           if (-not $publicKeyBase64) {
             throw "Updater public key is missing."
           }
 
-          # Decode the configured public key
+          # Decode the historical public key.
           $publicKeyFile = "$env:RUNNER_TEMP\liba-bilancia.pub"
 
-          $publicKeyBytes = [Convert]::FromBase64String($publicKeyBase64.Trim())
-          [IO.File]::WriteAllBytes($publicKeyFile, $publicKeyBytes)
+          $publicKeyBytes = [Convert]::FromBase64String(
+            $publicKeyBase64.Trim()
+          )
 
-          # Create a small diagnostic file
+          [IO.File]::WriteAllBytes(
+            $publicKeyFile,
+            $publicKeyBytes
+          )
+
+          # Create a small diagnostic file.
           $probe = "$env:RUNNER_TEMP\signing-probe.txt"
-          [IO.File]::WriteAllText($probe, "Liba Bilancia signing test 1.4.7")
+
+          [IO.File]::WriteAllText(
+            $probe,
+            "Liba Bilancia signing test 1.4.7"
+          )
 
           Write-Host "========================================"
           Write-Host "TEST 1: PRIVATE/PUBLIC KEY MATCH"
           Write-Host "========================================"
 
-          # Sign using the same GitHub secret as the Tauri build
+          # Sign using the same GitHub secret used by the Tauri build.
           & ".\node_modules\.bin\tauri.cmd" signer sign $probe --app-version "1.4.7"
 
           if ($LASTEXITCODE -ne 0) {
@@ -161,16 +220,20 @@ jobs:
             throw "Tauri did not create the diagnostic signature file."
           }
 
-          # Decode the diagnostic signature
+          # Tauri stores the signature in base64-wrapped form.
+          # Minisign needs the decoded .minisig representation.
           $probeDecoded = "$env:RUNNER_TEMP\probe.minisig"
 
           $probeBytes = [Convert]::FromBase64String(
             [IO.File]::ReadAllText($probeSignature).Trim()
           )
 
-          [IO.File]::WriteAllBytes($probeDecoded, $probeBytes)
+          [IO.File]::WriteAllBytes(
+            $probeDecoded,
+            $probeBytes
+          )
 
-          # Verify the probe against the historical public key
+          # Verify the probe against the historical public key.
           & $env:MINISIGN_PATH -Vm $probe `
             -p $publicKeyFile `
             -x $probeDecoded
@@ -199,19 +262,22 @@ jobs:
             throw "Installer signature is missing."
           }
 
-          # Decode the installer signature
+          # Decode the installer signature.
           $signatureDecoded = "$env:RUNNER_TEMP\installer.minisig"
 
           $signatureBytes = [Convert]::FromBase64String(
             [IO.File]::ReadAllText($installerSignature).Trim()
           )
 
-          [IO.File]::WriteAllBytes($signatureDecoded, $signatureBytes)
+          [IO.File]::WriteAllBytes(
+            $signatureDecoded,
+            $signatureBytes
+          )
 
           Write-Host "Installer: $($installer.FullName)"
           Write-Host "Signature: $installerSignature"
 
-          # Verify the actual installer
+          # Verify the actual installer.
           & $env:MINISIGN_PATH -Vm $installer.FullName `
             -p $publicKeyFile `
             -x $signatureDecoded
