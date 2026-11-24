@@ -59,12 +59,14 @@ jobs:
           Expand-Archive -Path $zip -DestinationPath $dir -Force
 
           $exe = Get-ChildItem $dir -Recurse -Filter "minisign.exe" |
+            Where-Object { $_.FullName -match "\\x86_64\\" } |
             Select-Object -First 1
 
           if (-not $exe) {
-            throw "Could not find minisign.exe after extraction."
+            throw "Could not find the x86_64 minisign.exe after extraction."
           }
 
+          Write-Host "Using Minisign: $($exe.FullName)"
           "MINISIGN_PATH=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8
 
       - name: Verify generated updater signature
