@@ -73,7 +73,7 @@ jobs:
         shell: pwsh
         run: |
           $config = Get-Content "src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json
-          $publicKeyBase64 = $config.plugins.updater.pubkey
+          $publicKeyBase64 = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdEMkNCODIxQTlFNTgxQ0EKUldUS2dlV3BJYmdzZlZob2ZVaFB0T1l2OVNhYmtjTUZIV2puSHRIZTR4QUlQUkhjUVI4OXVWSDUK"
 
           if (-not $publicKeyBase64) {
             throw "Updater public key is missing."
