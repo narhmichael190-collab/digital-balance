@@ -87,17 +87,25 @@ jobs:
           }
 
           $config = Get-Content "src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json
-          $publicKey = $config.plugins.updater.pubkey
+          $publicKeyBase64 = $config.plugins.updater.pubkey
 
-          if (-not $publicKey) {
+          if (-not $publicKeyBase64) {
             throw "Could not find the updater public key in tauri.conf.json."
           }
 
+          $publicKeyFile = "$env:RUNNER_TEMP\liba-bilancia.pub"
+
+          [IO.File]::WriteAllBytes(
+            $publicKeyFile,
+            [Convert]::FromBase64String($publicKeyBase64)
+          )
+
           Write-Host "Installer: $($exe.FullName)"
           Write-Host "Signature: $($sig.FullName)"
+          Write-Host "Public key: $publicKeyFile"
 
           & $env:MINISIGN_PATH -Vm $exe.FullName `
-            -P $publicKey `
+            -p $publicKeyFile `
             -x $sig.FullName
 
           if ($LASTEXITCODE -ne 0) {
