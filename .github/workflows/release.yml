@@ -69,6 +69,61 @@ jobs:
           Write-Host "Using Minisign: $($exe.FullName)"
           "MINISIGN_PATH=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8
 
+      - name: Derive public key from GitHub private key
+        shell: pwsh
+        run: |
+          $secretKeyFile = "$env:RUNNER_TEMP\tauri-signing.key"
+          $derivedPublicKey = "$env:RUNNER_TEMP\derived.pub"
+
+          # Write the GitHub secret to a temporary runner-only file.
+          [IO.File]::WriteAllText(
+            $secretKeyFile,
+            $env:TAURI_SIGNING_PRIVATE_KEY
+          )
+
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = $env:MINISIGN_PATH
+          $psi.Arguments = "-R -f -s `"$secretKeyFile`" -p `"$derivedPublicKey`""
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardInput = $true
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $psi.CreateNoWindow = $true
+
+          $process = New-Object System.Diagnostics.Process
+          $process.StartInfo = $psi
+
+          [void]$process.Start()
+
+          # Supply the password through stdin; never put it in the command line.
+          $process.StandardInput.WriteLine(
+            $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          )
+          $process.StandardInput.Close()
+
+          $stdout = $process.StandardOutput.ReadToEnd()
+          $stderr = $process.StandardError.ReadToEnd()
+
+          $process.WaitForExit()
+
+          if ($process.ExitCode -ne 0) {
+            Write-Host $stdout
+            Write-Host $stderr
+            throw "Could not derive the public key from the GitHub private key."
+          }
+
+          if (-not (Test-Path $derivedPublicKey)) {
+            throw "Minisign did not create the derived public key."
+          }
+
+          Write-Host "========================================"
+          Write-Host "PUBLIC KEY DERIVED FROM GITHUB SECRET"
+          Write-Host "========================================"
+          Get-Content $derivedPublicKey
+
+          # Remove the temporary private-key file after use.
+          Remove-Item $secretKeyFile -Force -ErrorAction SilentlyContinue
+
       - name: Diagnose updater signing key and installer
         shell: pwsh
         run: |
@@ -115,13 +170,13 @@ jobs:
 
           [IO.File]::WriteAllBytes($probeDecoded, $probeBytes)
 
-          # Verify the probe against the configured public key
+          # Verify the probe against the historical public key
           & $env:MINISIGN_PATH -Vm $probe `
             -p $publicKeyFile `
             -x $probeDecoded
 
           if ($LASTEXITCODE -ne 0) {
-            throw "KEYPAIR TEST FAILED: The GitHub private key does not verify against the configured public key."
+            throw "KEYPAIR TEST FAILED: The GitHub private key does not verify against the tested historical public key."
           }
 
           Write-Host "PASS: Private and public signing keys match."
