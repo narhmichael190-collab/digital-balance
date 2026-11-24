@@ -93,21 +93,31 @@ jobs:
             throw "Could not find the updater public key in tauri.conf.json."
           }
 
+          # Decode the Base64-encoded public key
           $publicKeyFile = "$env:RUNNER_TEMP\liba-bilancia.pub"
 
-          [IO.File]::WriteAllBytes(
-            $publicKeyFile,
-            [Convert]::FromBase64String($publicKeyBase64)
-          )
+          $publicKeyBytes = [Convert]::FromBase64String($publicKeyBase64.Trim())
+          [IO.File]::WriteAllBytes($publicKeyFile, $publicKeyBytes)
+
+          # Decode the Base64-encoded signature
+          $signatureFile = "$env:RUNNER_TEMP\liba-bilancia.minisig"
+
+          $signatureBase64 = [IO.File]::ReadAllText($sig.FullName).Trim()
+          $signatureBytes = [Convert]::FromBase64String($signatureBase64)
+          [IO.File]::WriteAllBytes($signatureFile, $signatureBytes)
 
           Write-Host "Installer: $($exe.FullName)"
-          Write-Host "Signature: $($sig.FullName)"
-          Write-Host "Public key: $publicKeyFile"
+          Write-Host "Original signature: $($sig.FullName)"
+          Write-Host "Decoded public key: $publicKeyFile"
+          Write-Host "Decoded signature: $signatureFile"
 
+          # Verify the installer using the decoded Minisign files
           & $env:MINISIGN_PATH -Vm $exe.FullName `
             -p $publicKeyFile `
-            -x $sig.FullName
+            -x $signatureFile
 
           if ($LASTEXITCODE -ne 0) {
             throw "Minisign verification failed with exit code $LASTEXITCODE."
           }
+
+          Write-Host "SUCCESS: Minisign signature verification passed."
