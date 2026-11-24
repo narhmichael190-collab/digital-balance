@@ -46,3 +46,39 @@ jobs:
           releaseDraft: false
           prerelease: false
           updaterJsonPreferNsis: true
+
+      - name: Install Minisign verifier
+        shell: pwsh
+        run: |
+          cargo install minisign --version 0.2.1 --locked
+
+      - name: Verify generated updater signature
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem "src-tauri\target\release\bundle\nsis\*.exe" |
+            Where-Object { $_.Name -notlike "*-uninstaller.exe" } |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "Could not find the generated NSIS installer."
+          }
+
+          $sig = Get-Item "$($exe.FullName).sig" -ErrorAction SilentlyContinue
+
+          if (-not $sig) {
+            throw "Could not find signature file for $($exe.Name)."
+          }
+
+          $config = Get-Content "src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json
+          $publicKey = $config.plugins.updater.pubkey
+
+          if (-not $publicKey) {
+            throw "Could not find the updater public key in tauri.conf.json."
+          }
+
+          Write-Host "Installer: $($exe.FullName)"
+          Write-Host "Signature: $($sig.FullName)"
+
+          minisign -Vm $exe.FullName `
+            -P $publicKey `
+            -x $sig.FullName
