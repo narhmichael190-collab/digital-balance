@@ -10,6 +10,9 @@ jobs:
   verify:
     runs-on: windows-latest
 
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
     steps:
       - name: Download Minisign
         shell: pwsh
@@ -35,72 +38,122 @@ jobs:
 
           Write-Host "Using Minisign: $($exe.FullName)"
 
-      - name: Download v1.4.8 installer and signature
+      - name: Find v1.4.8 release assets
         shell: pwsh
         run: |
-          $base = "https://github.com/narhmichael190-collab/digital-balance/releases/download/v1.4.8"
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
 
-          Invoke-WebRequest `
-            -Uri "$base/Liba%20Bilancia_1.4.8_x64-setup.exe" `
-            -OutFile "$env:RUNNER_TEMP\Liba-Bilancia-1.4.8.exe"
+          $api = "https://api.github.com/repos/narhmichael190-collab/digital-balance/releases/tags/v1.4.8"
 
-          Invoke-WebRequest `
-            -Uri "$base/Liba%20Bilancia_1.4.8_x64-setup.exe.sig" `
-            -OutFile "$env:RUNNER_TEMP\signature.sig"
-
-          Write-Host "Installer:"
-          Get-Item "$env:RUNNER_TEMP\Liba-Bilancia-1.4.8.exe" |
-            Select-Object FullName, Length
+          Write-Host "Getting release information..."
+          $release = Invoke-RestMethod -Uri $api -Headers $headers -Method Get
 
           Write-Host ""
-          Write-Host "Downloaded signature:"
-          Get-Item "$env:RUNNER_TEMP\signature.sig" |
-            Select-Object FullName, Length
+          Write-Host "Assets found in v1.4.8:"
+          $release.assets | ForEach-Object {
+            Write-Host " - $($_.name)"
+          }
+
+          $installer = $release.assets |
+            Where-Object {
+              $_.name -match '1\.4\.8.*x64-setup\.exe$'
+            } |
+            Select-Object -First 1
+
+          if (-not $installer) {
+            throw "Could not find the v1.4.8 x64 NSIS installer asset."
+          }
+
+          $signature = $release.assets |
+            Where-Object {
+              $_.name -eq "$($installer.name).sig"
+            } |
+            Select-Object -First 1
+
+          if (-not $signature) {
+            throw "Could not find signature asset: $($installer.name).sig"
+          }
+
+          Write-Host ""
+          Write-Host "Selected installer:"
+          Write-Host $installer.name
+
+          Write-Host ""
+          Write-Host "Selected signature:"
+          Write-Host $signature.name
+
+          "INSTALLER_URL=$($installer.browser_download_url)" | Out-File $env:GITHUB_ENV -Append
+          "SIGNATURE_URL=$($signature.browser_download_url)" | Out-File $env:GITHUB_ENV -Append
+          "INSTALLER_NAME=$($installer.name)" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Download actual v1.4.8 installer and signature
+        shell: pwsh
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+          }
+
+          $installerPath = "$env:RUNNER_TEMP\v148-installer.exe"
+          $signaturePath = "$env:RUNNER_TEMP\v148-installer.sig"
+
+          Invoke-WebRequest `
+            -Uri $env:INSTALLER_URL `
+            -Headers $headers `
+            -OutFile $installerPath
+
+          Invoke-WebRequest `
+            -Uri $env:SIGNATURE_URL `
+            -Headers $headers `
+            -OutFile $signaturePath
+
+          Write-Host "Installer downloaded:"
+          Get-Item $installerPath | Select-Object FullName, Length
+
+          Write-Host ""
+          Write-Host "Signature downloaded:"
+          Get-Item $signaturePath | Select-Object FullName, Length
 
       - name: Prepare signature
         shell: pwsh
         run: |
-          $sigPath = "$env:RUNNER_TEMP\signature.sig"
-          $raw = [System.IO.File]::ReadAllBytes($sigPath)
+          $sigPath = "$env:RUNNER_TEMP\v148-installer.sig"
+          $preparedPath = "$env:RUNNER_TEMP\signature.decoded.sig"
 
-          # Tauri's GitHub release asset may contain a Base64-wrapped
-          # signature rather than the raw Minisign signature.
+          $raw = [System.IO.File]::ReadAllBytes($sigPath)
           $text = [System.Text.Encoding]::UTF8.GetString($raw).Trim()
 
           if ($text -match '^[A-Za-z0-9+/=\r\n]+$') {
             try {
-              $decoded = [Convert]::FromBase64String(
-                ($text -replace '\s','')
-              )
-
+              $cleanBase64 = $text -replace '\s',''
+              $decoded = [Convert]::FromBase64String($cleanBase64)
               $decodedText = [System.Text.Encoding]::UTF8.GetString($decoded)
 
               if ($decodedText -match '^untrusted comment:') {
-                [System.IO.File]::WriteAllBytes(
-                  "$env:RUNNER_TEMP\signature.decoded.sig",
-                  $decoded
-                )
-
-                Write-Host "Signature was Base64-wrapped and has been decoded."
+                [System.IO.File]::WriteAllBytes($preparedPath, $decoded)
+                Write-Host "Signature was Base64-wrapped and decoded."
               }
               else {
-                Copy-Item $sigPath "$env:RUNNER_TEMP\signature.decoded.sig"
+                Copy-Item $sigPath $preparedPath -Force
                 Write-Host "Downloaded signature was not a Tauri Base64 wrapper."
               }
             }
             catch {
-              Copy-Item $sigPath "$env:RUNNER_TEMP\signature.decoded.sig"
-              Write-Host "Signature was not Base64-decodable; using it directly."
+              Copy-Item $sigPath $preparedPath -Force
+              Write-Host "Base64 decoding failed; using signature directly."
             }
           }
           else {
-            Copy-Item $sigPath "$env:RUNNER_TEMP\signature.decoded.sig"
+            Copy-Item $sigPath $preparedPath -Force
             Write-Host "Signature is already raw Minisign format."
           }
 
           Write-Host ""
           Write-Host "Prepared signature:"
-          Get-Content "$env:RUNNER_TEMP\signature.decoded.sig" -ErrorAction Stop
+          Get-Content $preparedPath
 
       - name: Create OX29 public key
         shell: pwsh
@@ -116,13 +169,16 @@ jobs:
       - name: Verify actual v1.4.8 signature
         shell: pwsh
         run: |
+          Write-Host ""
           Write-Host "========================================"
           Write-Host "VERIFYING ACTUAL v1.4.8 SIGNATURE"
           Write-Host "========================================"
           Write-Host ""
+          Write-Host "Installer: $env:INSTALLER_NAME"
+          Write-Host ""
 
           & "$env:MINISIGN_PATH" `
-            -Vm "$env:RUNNER_TEMP\Liba-Bilancia-1.4.8.exe" `
+            -Vm "$env:RUNNER_TEMP\v148-installer.exe" `
             -P "$env:RUNNER_TEMP\ox29.pub" `
             -x "$env:RUNNER_TEMP\signature.decoded.sig"
 
