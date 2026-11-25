@@ -1,0 +1,115 @@
+name: Verify latest.json Signature
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+
+    steps:
+      - name: Download Minisign
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\minisign.zip"
+          $dir = "$env:RUNNER_TEMP\minisign"
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip" `
+            -OutFile $zip
+
+          Expand-Archive $zip -DestinationPath $dir -Force
+
+          $exe = Get-ChildItem $dir -Filter minisign.exe -Recurse |
+            Where-Object { $_.FullName -match "\\x86_64\\minisign\.exe$" } |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "Could not find x86_64 minisign.exe"
+          }
+
+          "MINISIGN_PATH=$($exe.FullName)" |
+            Out-File $env:GITHUB_ENV -Append
+
+          Write-Host "Using Minisign: $($exe.FullName)"
+
+      - name: Download latest.json
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://github.com/narhmichael190-collab/digital-balance/releases/latest/download/latest.json" `
+            -OutFile "$env:RUNNER_TEMP\latest.json"
+
+          Write-Host "Downloaded latest.json:"
+          Get-Content "$env:RUNNER_TEMP\latest.json"
+
+      - name: Download installer
+        shell: pwsh
+        run: |
+          $url = "https://api.github.com/repos/narhmichael190-collab/digital-balance/releases/assets/790657985"
+
+          $headers = @{
+            Accept = "application/octet-stream"
+          }
+
+          Invoke-WebRequest `
+            -Uri $url `
+            -Headers $headers `
+            -OutFile "$env:RUNNER_TEMP\installer.exe"
+
+          Write-Host "Installer downloaded:"
+          Get-Item "$env:RUNNER_TEMP\installer.exe" |
+            Select-Object Length
+
+      - name: Extract signature from latest.json
+        shell: pwsh
+        run: |
+          $json = Get-Content `
+            "$env:RUNNER_TEMP\latest.json" `
+            -Raw |
+            ConvertFrom-Json
+
+          $signature = $json.platforms.'windows-x86_64-nsis'.signature
+
+          if (-not $signature) {
+            throw "Could not find windows-x86_64-nsis signature."
+          }
+
+          $decoded = [Convert]::FromBase64String($signature)
+
+          [System.IO.File]::WriteAllBytes(
+            "$env:RUNNER_TEMP\latest-json.sig",
+            $decoded
+          )
+
+          Write-Host "Signature extracted from latest.json:"
+          Get-Content "$env:RUNNER_TEMP\latest-json.sig"
+
+      - name: Verify latest.json signature
+        shell: pwsh
+        run: |
+          $pubkey = "RWTKgeWpIbgsfVhofUhPtOX29SabkcMFHWjnHtHe4xAIPRHcQR89uVH5"
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "VERIFYING SIGNATURE FROM latest.json"
+          Write-Host "========================================"
+          Write-Host ""
+
+          & "$env:MINISIGN_PATH" `
+            -Vm "$env:RUNNER_TEMP\installer.exe" `
+            -P "$pubkey" `
+            -x "$env:RUNNER_TEMP\latest-json.sig"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "SIGNATURE FROM latest.json DOES NOT VERIFY."
+          }
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "SUCCESS"
+          Write-Host "latest.json signature is valid."
+          Write-Host "========================================"
