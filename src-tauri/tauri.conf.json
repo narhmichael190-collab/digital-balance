@@ -36,7 +36,7 @@
       }
     },
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaW5nIHB1YmxpYyBrZXk6IDdEMkNCODIxQTlFNTgxQ0EKUldUS2dlV3BJYmdzZlZob2ZVaFB0T1Y2OVNhYmtjTUZIV2puSHRIZTR4QUlQUkhjUVI4OXVWSDUK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaW5nIHB1YmxpYyBrZXk6IDdEMkNCODIxQTlFNTgxQ0EKUldUS2dlV3BJYmdzZlZob2ZVaFB0T1gyOVNhYmtjTUZIV2puSHRIZTR4QUlQUkhjUVI4OXVWSDUK",
       "endpoints": [
         "https://github.com/narhmichael190-collab/digital-balance/releases/latest/download/latest.json"
       ],
