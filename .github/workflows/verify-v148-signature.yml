@@ -1,0 +1,136 @@
+name: Verify v1.4.8 Signature
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+
+    steps:
+      - name: Download Minisign
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\minisign.zip"
+          $dir = "$env:RUNNER_TEMP\minisign"
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip" `
+            -OutFile $zip
+
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+
+          $exe = Get-ChildItem -Path $dir -Filter "minisign.exe" -Recurse |
+            Where-Object { $_.FullName -match "\\x86_64\\minisign\.exe$" } |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "Could not find x86_64 minisign.exe"
+          }
+
+          "MINISIGN_PATH=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Append
+
+          Write-Host "Using Minisign: $($exe.FullName)"
+
+      - name: Download v1.4.8 installer and signature
+        shell: pwsh
+        run: |
+          $base = "https://github.com/narhmichael190-collab/digital-balance/releases/download/v1.4.8"
+
+          Invoke-WebRequest `
+            -Uri "$base/Liba%20Bilancia_1.4.8_x64-setup.exe" `
+            -OutFile "$env:RUNNER_TEMP\Liba-Bilancia-1.4.8.exe"
+
+          Invoke-WebRequest `
+            -Uri "$base/Liba%20Bilancia_1.4.8_x64-setup.exe.sig" `
+            -OutFile "$env:RUNNER_TEMP\signature.sig"
+
+          Write-Host "Installer:"
+          Get-Item "$env:RUNNER_TEMP\Liba-Bilancia-1.4.8.exe" |
+            Select-Object FullName, Length
+
+          Write-Host ""
+          Write-Host "Downloaded signature:"
+          Get-Item "$env:RUNNER_TEMP\signature.sig" |
+            Select-Object FullName, Length
+
+      - name: Prepare signature
+        shell: pwsh
+        run: |
+          $sigPath = "$env:RUNNER_TEMP\signature.sig"
+          $raw = [System.IO.File]::ReadAllBytes($sigPath)
+
+          # Tauri's GitHub release asset may contain a Base64-wrapped
+          # signature rather than the raw Minisign signature.
+          $text = [System.Text.Encoding]::UTF8.GetString($raw).Trim()
+
+          if ($text -match '^[A-Za-z0-9+/=\r\n]+$') {
+            try {
+              $decoded = [Convert]::FromBase64String(
+                ($text -replace '\s','')
+              )
+
+              $decodedText = [System.Text.Encoding]::UTF8.GetString($decoded)
+
+              if ($decodedText -match '^untrusted comment:') {
+                [System.IO.File]::WriteAllBytes(
+                  "$env:RUNNER_TEMP\signature.decoded.sig",
+                  $decoded
+                )
+
+                Write-Host "Signature was Base64-wrapped and has been decoded."
+              }
+              else {
+                Copy-Item $sigPath "$env:RUNNER_TEMP\signature.decoded.sig"
+                Write-Host "Downloaded signature was not a Tauri Base64 wrapper."
+              }
+            }
+            catch {
+              Copy-Item $sigPath "$env:RUNNER_TEMP\signature.decoded.sig"
+              Write-Host "Signature was not Base64-decodable; using it directly."
+            }
+          }
+          else {
+            Copy-Item $sigPath "$env:RUNNER_TEMP\signature.decoded.sig"
+            Write-Host "Signature is already raw Minisign format."
+          }
+
+          Write-Host ""
+          Write-Host "Prepared signature:"
+          Get-Content "$env:RUNNER_TEMP\signature.decoded.sig" -ErrorAction Stop
+
+      - name: Create OX29 public key
+        shell: pwsh
+        run: |
+          @'
+          untrusted comment: minisign public key: 7D2CB821A9E581CA
+          RWTKgeWpIbgsfVhofUhPtOX29SabkcMFHWjnHtHe4xAIPRHcQR89uVH5
+          '@ | Set-Content "$env:RUNNER_TEMP\ox29.pub" -Encoding ascii
+
+          Write-Host "Testing against OX29 public key:"
+          Get-Content "$env:RUNNER_TEMP\ox29.pub"
+
+      - name: Verify actual v1.4.8 signature
+        shell: pwsh
+        run: |
+          Write-Host "========================================"
+          Write-Host "VERIFYING ACTUAL v1.4.8 SIGNATURE"
+          Write-Host "========================================"
+          Write-Host ""
+
+          & "$env:MINISIGN_PATH" `
+            -Vm "$env:RUNNER_TEMP\Liba-Bilancia-1.4.8.exe" `
+            -P "$env:RUNNER_TEMP\ox29.pub" `
+            -x "$env:RUNNER_TEMP\signature.decoded.sig"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "v1.4.8 signature verification FAILED against OX29."
+          }
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "SUCCESS: v1.4.8 VERIFIED AGAINST OX29"
+          Write-Host "========================================"
