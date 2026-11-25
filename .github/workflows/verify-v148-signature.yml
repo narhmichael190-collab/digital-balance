@@ -49,11 +49,12 @@ jobs:
 
           $api = "https://api.github.com/repos/narhmichael190-collab/digital-balance/releases/tags/v1.4.8"
 
-          Write-Host "Getting release information..."
-          $release = Invoke-RestMethod -Uri $api -Headers $headers -Method Get
+          $release = Invoke-RestMethod `
+            -Uri $api `
+            -Headers $headers `
+            -Method Get
 
-          Write-Host ""
-          Write-Host "Assets found in v1.4.8:"
+          Write-Host "Assets found:"
           $release.assets | ForEach-Object {
             Write-Host " - $($_.name)"
           }
@@ -65,7 +66,7 @@ jobs:
             Select-Object -First 1
 
           if (-not $installer) {
-            throw "Could not find the v1.4.8 x64 NSIS installer asset."
+            throw "Could not find the v1.4.8 x64 NSIS installer."
           }
 
           $signature = $release.assets |
@@ -75,47 +76,47 @@ jobs:
             Select-Object -First 1
 
           if (-not $signature) {
-            throw "Could not find signature asset: $($installer.name).sig"
+            throw "Could not find matching signature asset."
           }
 
           Write-Host ""
-          Write-Host "Selected installer:"
-          Write-Host $installer.name
+          Write-Host "Installer: $($installer.name)"
+          Write-Host "Signature: $($signature.name)"
 
-          Write-Host ""
-          Write-Host "Selected signature:"
-          Write-Host $signature.name
+          "INSTALLER_URL=$($installer.browser_download_url)" |
+            Out-File $env:GITHUB_ENV -Append
 
-          "INSTALLER_URL=$($installer.browser_download_url)" | Out-File $env:GITHUB_ENV -Append
-          "SIGNATURE_URL=$($signature.browser_download_url)" | Out-File $env:GITHUB_ENV -Append
-          "INSTALLER_NAME=$($installer.name)" | Out-File $env:GITHUB_ENV -Append
+          "SIGNATURE_URL=$($signature.browser_download_url)" |
+            Out-File $env:GITHUB_ENV -Append
 
-      - name: Download actual v1.4.8 installer and signature
+          "INSTALLER_NAME=$($installer.name)" |
+            Out-File $env:GITHUB_ENV -Append
+
+      - name: Download installer and signature
         shell: pwsh
         run: |
           $headers = @{
             Authorization = "Bearer $env:GITHUB_TOKEN"
           }
 
-          $installerPath = "$env:RUNNER_TEMP\v148-installer.exe"
-          $signaturePath = "$env:RUNNER_TEMP\v148-installer.sig"
-
           Invoke-WebRequest `
             -Uri $env:INSTALLER_URL `
             -Headers $headers `
-            -OutFile $installerPath
+            -OutFile "$env:RUNNER_TEMP\v148-installer.exe"
 
           Invoke-WebRequest `
             -Uri $env:SIGNATURE_URL `
             -Headers $headers `
-            -OutFile $signaturePath
+            -OutFile "$env:RUNNER_TEMP\v148-installer.sig"
 
           Write-Host "Installer downloaded:"
-          Get-Item $installerPath | Select-Object FullName, Length
+          Get-Item "$env:RUNNER_TEMP\v148-installer.exe" |
+            Select-Object FullName, Length
 
           Write-Host ""
           Write-Host "Signature downloaded:"
-          Get-Item $signaturePath | Select-Object FullName, Length
+          Get-Item "$env:RUNNER_TEMP\v148-installer.sig" |
+            Select-Object FullName, Length
 
       - name: Prepare signature
         shell: pwsh
@@ -126,60 +127,53 @@ jobs:
           $raw = [System.IO.File]::ReadAllBytes($sigPath)
           $text = [System.Text.Encoding]::UTF8.GetString($raw).Trim()
 
-          if ($text -match '^[A-Za-z0-9+/=\r\n]+$') {
-            try {
-              $cleanBase64 = $text -replace '\s',''
-              $decoded = [Convert]::FromBase64String($cleanBase64)
-              $decodedText = [System.Text.Encoding]::UTF8.GetString($decoded)
+          try {
+            $decoded = [Convert]::FromBase64String(
+              ($text -replace '\s','')
+            )
 
-              if ($decodedText -match '^untrusted comment:') {
-                [System.IO.File]::WriteAllBytes($preparedPath, $decoded)
-                Write-Host "Signature was Base64-wrapped and decoded."
-              }
-              else {
-                Copy-Item $sigPath $preparedPath -Force
-                Write-Host "Downloaded signature was not a Tauri Base64 wrapper."
-              }
+            $decodedText = [System.Text.Encoding]::UTF8.GetString($decoded)
+
+            if ($decodedText -match '^untrusted comment:') {
+              [System.IO.File]::WriteAllBytes(
+                $preparedPath,
+                $decoded
+              )
+
+              Write-Host "Tauri Base64 wrapper decoded successfully."
             }
-            catch {
+            else {
               Copy-Item $sigPath $preparedPath -Force
-              Write-Host "Base64 decoding failed; using signature directly."
+              Write-Host "Signature was already raw Minisign format."
             }
           }
-          else {
+          catch {
             Copy-Item $sigPath $preparedPath -Force
-            Write-Host "Signature is already raw Minisign format."
+            Write-Host "Using signature directly."
           }
 
           Write-Host ""
           Write-Host "Prepared signature:"
           Get-Content $preparedPath
 
-      - name: Create OX29 public key
-        shell: pwsh
-        run: |
-          @'
-          untrusted comment: minisign public key: 7D2CB821A9E581CA
-          RWTKgeWpIbgsfVhofUhPtOX29SabkcMFHWjnHtHe4xAIPRHcQR89uVH5
-          '@ | Set-Content "$env:RUNNER_TEMP\ox29.pub" -Encoding ascii
-
-          Write-Host "Testing against OX29 public key:"
-          Get-Content "$env:RUNNER_TEMP\ox29.pub"
-
       - name: Verify actual v1.4.8 signature
         shell: pwsh
         run: |
+          $publicKey = "RWTKgeWpIbgsfVhofUhPtOX29SabkcMFHWjnHtHe4xAIPRHcQR89uVH5"
+
           Write-Host ""
           Write-Host "========================================"
           Write-Host "VERIFYING ACTUAL v1.4.8 SIGNATURE"
           Write-Host "========================================"
           Write-Host ""
           Write-Host "Installer: $env:INSTALLER_NAME"
+          Write-Host "Public key ID: 7D2CB821A9E581CA"
+          Write-Host "Public key: $publicKey"
           Write-Host ""
 
           & "$env:MINISIGN_PATH" `
             -Vm "$env:RUNNER_TEMP\v148-installer.exe" `
-            -P "$env:RUNNER_TEMP\ox29.pub" `
+            -P "$publicKey" `
             -x "$env:RUNNER_TEMP\signature.decoded.sig"
 
           if ($LASTEXITCODE -ne 0) {
