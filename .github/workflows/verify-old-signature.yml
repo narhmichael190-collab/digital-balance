@@ -1,0 +1,76 @@
+name: Verify v1.4.4 Signature
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+
+    steps:
+      - name: Download Minisign
+        shell: pwsh
+        run: |
+          $url = "https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip"
+          $zip = "$env:RUNNER_TEMP\minisign.zip"
+          $dir = "$env:RUNNER_TEMP\minisign"
+
+          Invoke-WebRequest $url -OutFile $zip
+          Expand-Archive $zip -DestinationPath $dir -Force
+
+          $exe = Get-ChildItem $dir -Recurse -Filter "minisign.exe" |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $exe) {
+            throw "minisign.exe was not found after extraction."
+          }
+
+          "MINISIGN=$exe" | Out-File $env:GITHUB_ENV -Encoding utf8
+
+      - name: Download v1.4.4 installer and signature
+        shell: pwsh
+        run: |
+          $base = "https://github.com/narhmichael190-collab/digital-balance/releases/download/v1.4.4"
+
+          Invoke-WebRequest `
+            "$base/Liba.Bilancia_1.4.4_x64-setup.exe" `
+            -OutFile "$env:RUNNER_TEMP\v144.exe"
+
+          Invoke-WebRequest `
+            "$base/Liba.Bilancia_1.4.4_x64-setup.exe.sig" `
+            -OutFile "$env:RUNNER_TEMP\v144.sig.b64"
+
+          $encoded = Get-Content "$env:RUNNER_TEMP\v144.sig.b64" -Raw
+
+          [Text.Encoding]::UTF8.GetString(
+            [Convert]::FromBase64String($encoded.Trim())
+          ) | Set-Content "$env:RUNNER_TEMP\v144.minisig" -Encoding ascii
+
+      - name: Create v1.4.4 public key
+        shell: pwsh
+        run: |
+          @"
+          untrusted comment: minisign public key: 7D2CB821A9E581CA
+          RWTKgeWpIbgsfVhofUhPtOV69SabkcMFHWjnHtHe4xAIPRHcQR89uVH5
+          "@ | Set-Content "$env:RUNNER_TEMP\v144.pub" -Encoding ascii
+
+      - name: Verify v1.4.4 signature
+        shell: pwsh
+        run: |
+          Write-Host "Verifying v1.4.4 against OV69 public key..."
+          Write-Host ""
+
+          & $env:MINISIGN `
+            -Vm "$env:RUNNER_TEMP\v144.exe" `
+            -x "$env:RUNNER_TEMP\v144.minisig" `
+            -p "$env:RUNNER_TEMP\v144.pub"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "v1.4.4 signature verification FAILED."
+          }
+
+          Write-Host ""
+          Write-Host "SUCCESS: v1.4.4 was signed by the OV69 key."
