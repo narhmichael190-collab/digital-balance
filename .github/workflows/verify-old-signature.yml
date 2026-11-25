@@ -22,12 +22,14 @@ jobs:
           Expand-Archive $zip -DestinationPath $dir -Force
 
           $exe = Get-ChildItem $dir -Recurse -Filter "minisign.exe" |
+            Where-Object { $_.FullName -match "\\x86_64\\" } |
             Select-Object -First 1 -ExpandProperty FullName
 
           if (-not $exe) {
-            throw "minisign.exe was not found after extraction."
+            throw "x86_64 minisign.exe was not found after extraction."
           }
 
+          Write-Host "Using Minisign: $exe"
           "MINISIGN=$exe" | Out-File $env:GITHUB_ENV -Encoding utf8
 
       - name: Download v1.4.4 installer and signature
@@ -61,6 +63,7 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "Verifying v1.4.4 against OV69 public key..."
+          Write-Host "Minisign: $env:MINISIGN"
           Write-Host ""
 
           & $env:MINISIGN `
