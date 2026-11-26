@@ -900,31 +900,283 @@ function LoginScreen({onLogin,notice}:{onLogin:()=>Promise<void>;notice:string})
 
 function Overview({data,score,today,topApps,streak,onStartFocus,onGo,currentRemaining,appName}:{data:TrackerData;score:number;today:{tracked:number;productive:number;distracting:number;focus:number};topApps:{name:string;exe:string;category:Category;secs:number}[];streak:number;onStartFocus:()=>void;onGo:(view:View)=>void;currentRemaining:number|null;appName:string}){const progress=Math.min(100,(today.focus/Math.max(1,data.settings.dailyFocusTargetMinutes))*100);return <div className="content-grid"><section className="hero-grid"><div className="hero-card hero-main"><span className="section-label">Liba Bilancia Score</span><div className="hero-title-row"><div><h2>{score>=80?'Locked in.':score>=60?'Good momentum.':'Time to reset.'}</h2><p>Your score combines focus, productive time and distraction control — not just raw screen time.</p><div className="hero-actions"><button className="primary-btn" onClick={onStartFocus}>Start Focus</button><button className="ghost-btn" onClick={()=>onGo('Control')}>Tune limits</button></div></div><div className="score-ring" style={{'--score':`${score}%`} as CSSProperties}><span>{score}</span></div></div></div><div className="stat-card"><span>Tracked today</span><strong>{time(today.tracked)}</strong><small>{minutes(today.productive)}m productive · {minutes(today.distracting)}m distracting</small></div><div className="stat-card"><span>Focus streak</span><strong>{streak}d</strong><small>{streak>0?'Keep the run alive.':'Complete a Focus session today.'}</small></div></section><section className="live-grid"><div className="panel live-panel"><div className="panel-head"><div><span className="section-label">Active Now</span><h3>{appName}</h3></div><span className={`live-chip ${data.tracking_paused?'off':''}`}>{data.tracking_paused?'Paused':'Live'}</span></div><div className="live-meta"><span>{data.current_category ?? 'Neutral'}</span><span>{time(data.current_session_secs)} current session</span>{currentRemaining!==null&&<span>{currentRemaining}m left on protection</span>}</div><div className="signal">{[1,2,3,4,5].map(i=><i key={i}/>)}</div></div><div className="panel focus-goal"><span className="section-label">TODAY'S FOCUS</span><strong>{today.focus} / {data.settings.dailyFocusTargetMinutes}m</strong><p>Complete the target to strengthen your Balance score and earn Coins.</p><div className="progress"><span style={{width:`${progress}%`}}/></div></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Usage</span><h3>Most-used apps</h3></div><button className="text-btn" onClick={()=>onGo('Insights')}>Open insights →</button></div><div className="app-list">{topApps.length?topApps.slice(0,8).map(app=><div className="app-row" key={app.exe}><div className="app-name"><span className={`category-dot ${app.category.toLowerCase()}`}/><div className="app-name-copy"><strong title={app.exe}>{app.name}</strong><span>{app.category}</span></div></div><div className="app-bar"><span style={{width:`${Math.max(3,(app.secs/topApps[0].secs)*100)}%`}}/></div><strong className="app-time">{time(app.secs)}</strong></div>):<div className="empty">Use the computer for a bit and your real app history will appear here.</div>}</div></section><section className="momentum-strip"><div><span className="section-label">Momentum</span><strong>{today.distracting<=data.settings.dailyDistractionLimitMinutes*60?'Within distraction limit':'Over your distraction target'}</strong><small>Liba Bilancia updates this in the background while you work.</small></div><button className="ghost-btn" onClick={()=>onGo('Rewards')}>Open Reward Lab</button></section></div>;}
 
-function FocusPage({data,minutes:focusMinutes,remaining,running,completed,focusApps,setFocusApps,knownApps,runningAppsLoading,runningAppsError,onRefreshApps,onDuration,onStart,onPause,onReset,onToggleFullscreen,fullscreen}:{data:TrackerData;minutes:number;remaining:number;running:boolean;completed:boolean;focusApps:string[];setFocusApps:(v:string[])=>void;knownApps:{name:string;exe:string}[];runningAppsLoading:boolean;runningAppsError:string;onRefreshApps:()=>Promise<void>;onDuration:(v:number)=>void;onStart:()=>void;onPause:()=>void;onReset:()=>void;onToggleFullscreen:()=>void;fullscreen:boolean}){
-  const mm=String(Math.floor(remaining/60)).padStart(2,'0');
-  const ss=String(remaining%60).padStart(2,'0');
-  const pct=Math.min(100,Math.max(0,100-(remaining/(focusMinutes*60))*100));
-  const phase=pct<18?'dawn':pct<40?'flow':pct<65?'deep':pct<88?'late':'finish';
-  const effect=(data.settings.equippedEffect||'effect:clean').replace('effect:','');
-  return <div className={`focus-session-page ${running?'is-running':''} effect-${effect}`} data-phase={phase}>
-    <div className="focus-ambient" aria-hidden="true">
-      <span className="ambient-orb orb-a"/><span className="ambient-orb orb-b"/><span className="ambient-orb orb-c"/><span className="ambient-orb orb-d"/><span className="ambient-vignette"/>
+function FocusPage({
+  data,
+  minutes: focusMinutes,
+  remaining,
+  running,
+  completed,
+  focusApps,
+  setFocusApps,
+  knownApps,
+  runningAppsLoading,
+  runningAppsError,
+  onRefreshApps,
+  onDuration,
+  onStart,
+  onPause,
+  onReset,
+  onToggleFullscreen,
+  fullscreen
+}: {
+  data: TrackerData;
+  minutes: number;
+  remaining: number;
+  running: boolean;
+  completed: boolean;
+  focusApps: string[];
+  setFocusApps: (v: string[]) => void;
+  knownApps: { name: string; exe: string }[];
+  runningAppsLoading: boolean;
+  runningAppsError: string;
+  onRefreshApps: () => Promise<void>;
+  onDuration: (v: number) => void;
+  onStart: () => void;
+  onPause: () => void;
+  onReset: () => void;
+  onToggleFullscreen: () => void;
+  fullscreen: boolean;
+}) {
+  const mm = String(Math.floor(remaining / 60)).padStart(2, '0');
+  const ss = String(remaining % 60).padStart(2, '0');
+
+  const totalSeconds = Math.max(1, focusMinutes * 60);
+  const pct = Math.min(100, Math.max(0, 100 - (remaining / totalSeconds) * 100));
+
+  const phase =
+    pct < 18 ? 'dawn' :
+    pct < 40 ? 'flow' :
+    pct < 65 ? 'deep' :
+    pct < 88 ? 'late' :
+    'finish';
+
+  const phaseText = running
+    ? phase === 'dawn' ? 'SETTLING IN'
+    : phase === 'flow' ? 'FIND YOUR RHYTHM'
+    : phase === 'deep' ? 'DEEP WORK'
+    : phase === 'late' ? 'HOLD THE LINE'
+    : 'FINAL STRETCH'
+    : completed
+      ? 'SESSION COMPLETE'
+      : 'READY';
+
+  const effect = (data.settings.equippedEffect || 'effect:clean').replace('effect:', '');
+
+  const modeDescription =
+    data.settings.mode === 'Deep Focus'
+      ? 'Hard lock-in. Protected apps close when the session takes over.'
+      : data.settings.mode === 'Smart'
+        ? 'Guided focus. Protected apps are handled automatically.'
+        : 'Low-friction focus. Selected apps get a courtesy window before enforcement.';
+
+  const updateDuration = (value: number) => {
+    if (!Number.isFinite(value)) return;
+    const next = Math.min(480, Math.max(1, Math.floor(value)));
+    onDuration(next);
+  };
+
+  return (
+    <div
+      className={`focus-session-page focus-clean-page ${running ? 'is-running' : ''} effect-${effect}`}
+      data-phase={phase}
+    >
+      <div className="focus-ambient" aria-hidden="true">
+        <span className="ambient-orb orb-a" />
+        <span className="ambient-orb orb-b" />
+        <span className="ambient-orb orb-c" />
+        <span className="ambient-orb orb-d" />
+        <span className="ambient-vignette" />
+      </div>
+
+      <div className="focus-clean">
+        <header className="focus-clean-header">
+          <div>
+            <div className="focus-clean-kicker">
+              <span className="section-label">Liba Bilancia · Focus</span>
+              <span className="focus-clean-mode">{data.settings.mode}</span>
+            </div>
+
+            <h2>{running ? 'Stay in the zone.' : 'Focus without guessing.'}</h2>
+
+            <p>
+              {running
+                ? 'Your session is active. Let Liba Bilancia handle the distractions.'
+                : modeDescription}
+            </p>
+          </div>
+
+          <div className="focus-clean-actions">
+            <span className="focus-clean-count">
+              {focusApps.length} protected app{focusApps.length === 1 ? '' : 's'}
+            </span>
+
+            <button className="ghost-btn small" onClick={onToggleFullscreen}>
+              {fullscreen ? 'Windowed' : 'Fullscreen'}
+            </button>
+          </div>
+        </header>
+
+        <section className="focus-clean-session">
+          <div className="focus-clean-timer-side">
+            <span className="focus-clean-phase">{phaseText}</span>
+
+            <div className="focus-clean-timer-ring">
+              <div
+                className="timer focus-clean-timer"
+                style={{ '--progress': `${pct}%` } as CSSProperties}
+              >
+                <div>{mm}:{ss}</div>
+                <small>
+                  {running ? 'Session in progress' : completed ? 'Completed' : 'Ready'}
+                </small>
+              </div>
+            </div>
+          </div>
+
+          <div className="focus-clean-controls">
+            <div>
+              <span className="section-label">Focus session</span>
+              <h3>Choose your session</h3>
+              <p className="focus-clean-description">
+                Pick a preset or enter any duration from 1 to 480 minutes.
+              </p>
+            </div>
+
+            <div className="focus-clean-duration">
+              <span className="focus-clean-label">Duration</span>
+
+              <div className="focus-clean-presets">
+                {[15, 25, 50, 90, 120].map((value) => (
+                  <button
+                    type="button"
+                    key={value}
+                    disabled={running}
+                    className={focusMinutes === value ? 'selected' : ''}
+                    onClick={() => updateDuration(value)}
+                  >
+                    {value} min
+                  </button>
+                ))}
+              </div>
+
+              <div className="focus-clean-custom">
+                <label htmlFor="focus-custom-minutes">Custom</label>
+                <div className="focus-clean-input-wrap">
+                  <input
+                    id="focus-custom-minutes"
+                    type="number"
+                    min="1"
+                    max="480"
+                    step="1"
+                    value={focusMinutes}
+                    disabled={running}
+                    onChange={(event) => {
+                      const value = Number(event.target.value);
+                      if (event.target.value === '') return;
+                      updateDuration(value);
+                    }}
+                    onBlur={() => updateDuration(focusMinutes)}
+                  />
+                  <span>minutes</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="focus-clean-divider" />
+
+            <div className="focus-clean-session-actions">
+              <button
+                className="primary-btn"
+                onClick={running ? onPause : onStart}
+              >
+                {running ? 'Pause' : remaining === 0 ? 'Restart' : 'Start focus'}
+              </button>
+
+              <button className="ghost-btn" onClick={onReset}>
+                Reset
+              </button>
+            </div>
+
+            <div className="focus-clean-status">
+              <span>{running ? 'Session active' : 'Ready when you are'}</span>
+              <span>{focusMinutes} min · {data.settings.mode}</span>
+            </div>
+          </div>
+        </section>
+
+        {completed && (
+          <div className="completion-banner focus-clean-completion">
+            <Icon name="spark" />
+            Session secured. Rewards delivered.
+          </div>
+        )}
+
+        <section className="focus-clean-protection panel">
+          <div className="focus-clean-protection-head">
+            <div>
+              <span className="section-label">Focus protection</span>
+              <h3>Choose the apps Focus should protect you from</h3>
+              <p>
+                Only open, visible apps appear here. Select the apps you want Focus
+                to protect against.
+              </p>
+            </div>
+
+            <div className="focus-clean-protection-tools">
+              <span className="mini-pill">{focusApps.length} selected</span>
+              <button
+                className="ghost-btn small"
+                onClick={() => void onRefreshApps()}
+                disabled={runningAppsLoading}
+              >
+                {runningAppsLoading ? 'Refreshing…' : 'Refresh apps'}
+              </button>
+            </div>
+          </div>
+
+          <div className="focus-clean-app-meta">
+            {knownApps.length} open app{knownApps.length === 1 ? '' : 's'} found
+          </div>
+
+          {runningAppsError ? (
+            <div className="empty focus-clean-empty">
+              Could not load running apps. {runningAppsError}
+            </div>
+          ) : knownApps.length ? (
+            <div className="focus-clean-app-grid">
+              {knownApps.map((app) => {
+                const selected = focusApps.includes(app.exe);
+
+                return (
+                  <button
+                    type="button"
+                    key={app.exe}
+                    title={app.exe}
+                    aria-pressed={selected}
+                    className={`focus-clean-app ${selected ? 'selected' : ''}`}
+                    onClick={() =>
+                      setFocusApps(
+                        selected
+                          ? focusApps.filter((x) => x !== app.exe)
+                          : [...focusApps, app.exe]
+                      )
+                    }
+                  >
+                    <span>{app.name}</span>
+                    {selected && <span className="focus-clean-check">✓</span>}
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="empty focus-clean-empty">
+              No open apps found. Open the apps you want to protect, then refresh this list.
+            </div>
+          )}
+        </section>
+      </div>
     </div>
-    <div className="focus-layout">
-      <section className="focus-card">
-        <div className="focus-mini-head"><div><span className="section-label">Liba Bilancia · Focus</span><strong>{data.settings.mode}</strong><small>{focusApps.length} protected app{focusApps.length===1?'':'s'}</small></div><div className="focus-window-actions"><button className="ghost-btn small" onClick={onToggleFullscreen}>{fullscreen?'Windowed':'Fullscreen'}</button></div></div>
-        <span className="focus-phase-label">{running?phase==='dawn'?'SETTLING IN':phase==='flow'?'FIND YOUR RHYTHM':phase==='deep'?'DEEP WORK':phase==='late'?'HOLD THE LINE':'FINAL STRETCH':completed?'SESSION COMPLETE':'READY'}</span>
-        <h2>{running?'Stay in the zone.':'Focus without guessing.'}</h2>
-        {!running && !completed && <p>{data.settings.mode==='Deep Focus'?'Hard lock-in. Protected apps close the moment the session takes over.':data.settings.mode==='Smart'?'Guided focus. Protected apps close automatically and your layout quiets down.':'Low-friction focus. Selected apps get a ten-minute courtesy window before enforcement.'}</p>}
-        <div className="timer-wrap"><div className="timer" style={{'--progress':`${pct}%`} as CSSProperties}><div>{mm}:{ss}</div><small>{running?'Session in progress':completed?'Completed':'Ready'}</small></div></div>
-        <div className="duration-row">{[15,25,50,90,120].map(v=><button key={v} disabled={running} className={focusMinutes===v?'selected':''} onClick={()=>onDuration(v)}>{v} min</button>)}</div>
-        <div className="focus-actions"><button className="primary-btn" onClick={running?onPause:onStart}>{running?'Pause':remaining===0?'Restart':'Start focus'}</button><button className="ghost-btn" onClick={onReset}>Reset</button></div>
-        {completed&&<div className="completion-banner"><Icon name="spark"/> Session secured. Rewards delivered.</div>}
-        {!running&&<div className="focus-mode-strip"><span>{effect==='nebula'||effect==='prism'||effect==='golden'?'Premium ambience equipped':'Ambient Focus'}</span><small>Lights breathe and shift through five phases while the session runs.</small></div>}
-      </section>
-      <section className="focus-side"><div className="panel focus-protection-panel"><div className="panel-head"><div><span className="section-label">Focus protection</span><h3>Choose open apps to block</h3></div><span className="mini-pill">{focusApps.length} selected</span></div><p className="muted-copy">Only apps with an open, visible window on this PC appear here. Select the apps you want Focus to protect against.</p><div className="focus-app-toolbar"><span>{knownApps.length} open app{knownApps.length===1?'':'s'} found</span><button className="ghost-btn small" onClick={()=>void onRefreshApps()} disabled={runningAppsLoading}>{runningAppsLoading?'Refreshing…':'Refresh apps'}</button></div>{runningAppsError?<div className="empty focus-app-empty">Could not load running apps. {runningAppsError}</div>:knownApps.length?<div className="chip-grid">{knownApps.map(app=><button type="button" key={app.exe} title={app.exe} aria-pressed={focusApps.includes(app.exe)} className={`app-chip ${focusApps.includes(app.exe)?'selected':''}`} onClick={()=>setFocusApps(focusApps.includes(app.exe)?focusApps.filter(x=>x!==app.exe):[...focusApps,app.exe])}><span>{app.name}</span>{focusApps.includes(app.exe)&&<span className="app-chip-check">✓</span>}</button>)}</div>:<div className="empty focus-app-empty">No open apps found. Open the apps you want to protect, then refresh this list.</div>}</div><div className="panel"><div className="panel-head"><div><span className="section-label">Mode behavior</span><h3>{data.settings.mode}</h3></div></div><p className="mode-copy">{data.settings.mode==='Deep Focus'?'Selected apps close as soon as they become active.':data.settings.mode==='Smart'?'Selected apps close when they become active, with the standard Focus layout.':'Selected apps receive a ten-minute grace window before they close.'}</p></div></section>
-    </div>
-  </div>;
+  );
 }
 
 function Insights({data,weekly,topApps}:{data:TrackerData;weekly:{label:string;productive:number;distracting:number;total:number}[];topApps:{name:string;exe:string;category:Category;secs:number}[]}){const max=Math.max(1,...weekly.map(x=>x.total));const consistency=Array.from({length:14},(_,index)=>{const date=new Date();date.setHours(12,0,0,0);date.setDate(date.getDate()-(13-index));const key=date.toDateString();const minutes=data.focus_sessions.filter(s=>new Date(s.completed_at).toDateString()===key).reduce((a,s)=>a+s.minutes,0);return {key,label:date.toLocaleDateString(undefined,{weekday:'short'}),day:date.getDate(),minutes};});const recentFocus=[...data.focus_sessions].sort((a,b)=>new Date(b.completed_at).getTime()-new Date(a.completed_at).getTime()).slice(0,8);return <div className="insights-grid"><section className="panel"><div className="panel-head"><div><span className="section-label">Last 7 Days</span><h3>Usage rhythm</h3></div><span className="mini-pill">Live</span></div><div className="week-chart">{weekly.map(day=><div className="week-day" key={day.label}><div className="stack"><i className="productive" style={{height:`${(day.productive/max)*190}px`}}/><i className="distracting" style={{height:`${(day.distracting/max)*190}px`}}/></div><small>{day.label}</small></div>)}</div></section><section className="panel"><span className="section-label">Session Patterns</span><div className="metric-list"><div><span>Longest session</span><strong>{time(Math.max(0,...data.sessions.map(s=>s.duration_secs)))}</strong></div><div><span>Most-used app</span><strong>{topApps[0]?.name??'No data yet'}</strong></div><div><span>Focus completions</span><strong>{data.focus_sessions.length}</strong></div><div><span>Coins earned</span><strong>{data.focus_sessions.reduce((a,s)=>a+s.coins,0)}</strong></div></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Focus Consistency</span><h3>Last 14 days</h3></div><span className="mini-pill">{consistency.filter(d=>d.minutes>0).length} active days</span></div><div className="consistency-grid">{consistency.map(day=><div className={`consistency-day ${day.minutes>0?'active':''}`} key={day.key} title={`${day.label} ${day.day}: ${day.minutes} min`}><span style={{opacity:Math.min(1,0.25+day.minutes/60)}}>{day.day}</span></div>)}</div><div className="consistency-legend"><span><i className="consistency-dot"/> Focus completed</span><span>{consistency.reduce((a,d)=>a+d.minutes,0)} min total</span></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Recent Focus</span><h3>Latest completed sessions</h3></div><span className="mini-pill">{recentFocus.length} shown</span></div><div className="focus-history-list">{recentFocus.length?recentFocus.map((item,index)=><div className="focus-history-row" key={`${item.completed_at}-${index}`}><div><strong>{item.minutes} min · {item.mode}</strong><small>{new Date(item.completed_at).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</small></div><div><span>{item.coins} coins</span><b>{item.points} focus pts</b></div></div>):<div className="empty">Complete a Focus session and your history will appear here.</div>}</div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Top Apps</span><h3>Where your time goes</h3></div></div><div className="rank-list">{topApps.slice(0,10).map((app,i)=><div key={app.exe}><span className="rank-num">#{String(i+1).padStart(2,'0')}</span><div className="rank-app-copy"><strong>{app.name}</strong><small>{app.category}</small></div><b>{time(app.secs)}</b></div>)}</div></section></div>;}
