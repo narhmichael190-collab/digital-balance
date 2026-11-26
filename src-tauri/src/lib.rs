@@ -118,7 +118,7 @@ impl Default for TrackerData {
 struct ActiveSession { exe: String, app_name: String, category: Category, pid: u32, started: DateTime<Utc> }
 
 #[derive(Debug)]
-struct Tracker { data: TrackerData, path: PathBuf, active: Option<ActiveSession>, focus_active: bool, focus_mode: Option<AppMode>, focus_started: Option<DateTime<Utc>>, focus_apps: HashSet<String>, casual_focus_started: HashMap<String, DateTime<Utc>>, closed_today: HashSet<String>, warn_pending: HashSet<String>, warn_reopen_counts: HashMap<String, u8>, warning_active: Option<(String, u32)>, closed_date: String }
+struct Tracker { data: TrackerData, path: PathBuf, active: Option<ActiveSession>, focus_active: bool, focus_mode: Option<AppMode>, focus_started: Option<DateTime<Utc>>, focus_apps: HashSet<String>, casual_focus_started: HashMap<String, DateTime<Utc>>, warn_observed: HashSet<String>, warn_reopen_counts: HashMap<String, u8>, warning_active: Option<(String, u32)>, closed_date: String }
 
 #[derive(Clone)]
 pub struct AppState(Arc<Mutex<Tracker>>);
@@ -188,13 +188,13 @@ impl Tracker {
         data.settings.ownedRewards = owned;
         if data.settings.displayName.trim().is_empty() || data.settings.displayName == "Digital Balance" { data.settings.displayName = "Liba Bilancia".into(); }
         if data.settings.theme.is_empty() { data.settings.theme = "theme:obsidian".into(); }
-        Self { data, path, active: None, focus_active: false, focus_mode: None, focus_started: None, focus_apps: HashSet::new(), casual_focus_started: HashMap::new(), closed_today: HashSet::new(), warn_pending: HashSet::new(), warn_reopen_counts: HashMap::new(), warning_active: None, closed_date: local_day() }
+        Self { data, path, active: None, focus_active: false, focus_mode: None, focus_started: None, focus_apps: HashSet::new(), casual_focus_started: HashMap::new(), warn_observed: HashSet::new(), warn_reopen_counts: HashMap::new(), warning_active: None, closed_date: local_day() }
     }
     fn persist(&self) {
         if let Some(parent) = self.path.parent() { let _ = fs::create_dir_all(parent); }
         if let Ok(raw) = serde_json::to_string_pretty(&self.data) { let _ = fs::write(&self.path, raw); }
     }
-    fn normalize_day(&mut self) { let now = local_day(); if now != self.closed_date { self.closed_date = now; self.closed_today.clear(); self.warn_pending.clear(); self.warn_reopen_counts.clear(); self.warning_active = None; } }
+    fn normalize_day(&mut self) { let now = local_day(); if now != self.closed_date { self.closed_date = now; self.warn_observed.clear(); self.warn_reopen_counts.clear(); self.warning_active = None; hide_limit_overlay(); } }
     fn category_for(&self, exe: &str) -> Category {
         self.data.settings.categoryOverrides.get(exe).cloned().unwrap_or_else(|| auto_category(exe))
     }
@@ -281,118 +281,125 @@ impl Tracker {
         self.normalize_day();
         if self.data.tracking_paused { return; }
 
-        if let Some((_, warning_pid)) = self.warning_active.clone() {
-            if !process_exists(warning_pid) {
+        let processes = enumerate_processes();
+        let running_exes: HashSet<String> = processes.iter().map(|p| p.exe.to_ascii_lowercase()).collect();
+        self.warn_observed.retain(|key| running_exes.contains(key));
+
+        if let Some((warning_exe, warning_pid)) = self.warning_active.clone() {
+            if !running_exes.contains(&warning_exe) || !process_exists(warning_pid) {
                 self.warning_active = None;
                 hide_limit_overlay();
             }
         }
 
-        let Some(active) = self.active.clone() else { return; };
-        let active_key = active.exe.to_ascii_lowercase();
-
-        if self.focus_active && self.focus_apps.contains(&active_key) {
-            match self.focus_mode.clone().unwrap_or(AppMode::Smart) {
-                AppMode::DeepFocus | AppMode::Smart => {
-                    self.close_pid(active.pid, &active.exe, "Focus protection");
-                    return;
-                }
-                AppMode::Casual => {
-                    let started = self.casual_focus_started.entry(active_key.clone()).or_insert_with(Utc::now);
-                    let grace = (Utc::now() - *started).num_seconds().max(0) as u64;
-                    if grace >= 10 * 60 {
-                        if let Some(handle) = GLOBAL_APP.get() { let _ = handle.emit("focus-grace-expired", serde_json::json!({"app": active.app_name, "limitMinutes": 10})); }
-                        self.close_pid(active.pid, &active.exe, "Casual Focus grace period ended");
-                        return;
+        if self.focus_active {
+            let mode = self.focus_mode.clone().unwrap_or(AppMode::Smart);
+            for blocked in self.focus_apps.clone() {
+                let matches: Vec<ProcessInfo> = processes.iter().filter(|p| p.exe.eq_ignore_ascii_case(&blocked)).cloned().collect();
+                if matches.is_empty() { continue; }
+                match mode {
+                    AppMode::DeepFocus | AppMode::Smart => {
+                        self.close_matching_exe(&blocked, "Focus protection");
+                    }
+                    AppMode::Casual => {
+                        let started = self.casual_focus_started.entry(blocked.clone()).or_insert_with(Utc::now);
+                        let grace = (Utc::now() - *started).num_seconds().max(0) as u64;
+                        if grace >= 10 * 60 {
+                            if let Some(handle) = GLOBAL_APP.get() {
+                                let _ = handle.emit("focus-grace-expired", serde_json::json!({"app": friendly_process_name(&blocked), "limitMinutes": 10}));
+                            }
+                            self.close_matching_exe(&blocked, "Casual Focus grace period ended");
+                        }
                     }
                 }
             }
         }
 
-        let Some(rule) = self.data.settings.appLimits.get(&active.exe).cloned() else { return; };
-        if !rule.enabled { return; }
-        if rule.scope == LimitScope::UntilDate {
-            if let Some(expires) = rule.expiresAt.as_deref().and_then(|raw| DateTime::parse_from_rfc3339(raw).ok()) {
-                if Utc::now() >= expires.with_timezone(&Utc) { return; }
+        let rules: Vec<(String, AppLimit)> = self.data.settings.appLimits.iter()
+            .map(|(exe, rule)| (exe.clone(), rule.clone()))
+            .collect();
+
+        for (configured_exe, rule) in rules {
+            if !rule.enabled { continue; }
+            if rule.scope == LimitScope::UntilDate {
+                if let Some(expires) = rule.expiresAt.as_deref().and_then(|raw| DateTime::parse_from_rfc3339(raw).ok()) {
+                    if Utc::now() >= expires.with_timezone(&Utc) { continue; }
+                }
             }
-        }
-        let used_seconds = self.usage_for_rule(&active.exe, &rule);
-        let limit_seconds = u64::from(rule.dailyMinutes).saturating_mul(60);
-        if used_seconds < limit_seconds { return; }
-        match rule.action {
-            LimitAction::Warn => {
-                let key = active_key.clone();
-                if self.warning_active.as_ref().map(|(_, pid)| *pid) == Some(active.pid) { return; }
-                if self.warn_pending.remove(&key) {
-                    let count = self.warn_reopen_counts.entry(key.clone()).or_insert(0);
-                    *count = count.saturating_add(1);
-                    if *count >= 3 {
-                        if let Some(current) = self.data.settings.appLimits.get_mut(&active.exe) { current.action = LimitAction::Block; }
-                        self.persist();
-                        self.close_pid(active.pid, &active.exe, "Three warning reopen attempts reached — protection switched to Block");
-                        hide_limit_overlay();
-                        return;
+
+            let key = configured_exe.to_ascii_lowercase();
+            let matches: Vec<ProcessInfo> = processes.iter().filter(|p| p.exe.eq_ignore_ascii_case(&configured_exe)).cloned().collect();
+            if matches.is_empty() { continue; }
+
+            let used_seconds = self.usage_for_rule(&configured_exe, &rule);
+            let limit_seconds = u64::from(rule.dailyMinutes).saturating_mul(60);
+            if used_seconds < limit_seconds { continue; }
+
+            match rule.action {
+                LimitAction::Warn => {
+                    if !self.warn_observed.contains(&key) {
+                        // End the mutable borrow from the warning-count map before
+                        // borrowing `self` again for enforcement/UI work.
+                        let count = {
+                            let entry = self.warn_reopen_counts.entry(key.clone()).or_insert(0);
+                            *entry = entry.saturating_add(1);
+                            *entry
+                        };
+
+                        self.warn_observed.insert(key.clone());
+
+                        if count > 3 {
+                            self.close_matching_exe(&configured_exe, "Three warnings used — protection is now blocking this app");
+                            self.warning_active = None;
+                            hide_limit_overlay();
+                        } else {
+                            let pid = matches[0].pid;
+                            self.warning_active = Some((key.clone(), pid));
+                            let app_name = friendly_process_name(&configured_exe);
+                            show_limit_overlay(&configured_exe, &app_name, pid, count);
+                            self.emit_limit(
+                                configured_exe.clone(),
+                                app_name,
+                                format!("Warning {} of 3 — close this app to continue", count),
+                                used_seconds,
+                                limit_seconds,
+                            );
+                        }
                     }
-                    self.warning_active = Some((key.clone(), active.pid));
-                    show_limit_overlay(&active.exe, &active.app_name, active.pid, *count);
-                    self.emit_limit(active.exe.clone(), active.app_name.clone(), "Warning — close this app to continue".into(), used_seconds, limit_seconds);
-                } else {
-                    self.warn_pending.insert(key);
-                    self.close_pid(active.pid, &active.exe, "Limit reached — app closed before warning");
                 }
-            }
-            LimitAction::Close => {
-                if !self.closed_today.contains(&active_key) {
-                    self.closed_today.insert(active_key);
-                    self.close_pid(active.pid, &active.exe, "Limit reached — app closed");
+                LimitAction::Close => {
+                    self.close_matching_exe(&configured_exe, "Limit reached — app closed");
                 }
-            }
-            LimitAction::Block => {
-                self.close_pid(active.pid, &active.exe, "Limit reached — blocked until the rule resets");
+                LimitAction::Block => {
+                    self.close_matching_exe(&configured_exe, "Limit reached — app blocked until the rule resets");
+                }
             }
         }
     }
     fn emit_limit(&self, exe: String, app: String, reason: String, used: u64, limit: u64) {
         if let Some(handle) = GLOBAL_APP.get() { let _ = handle.emit("app-limit-hit", serde_json::json!({"exe":exe,"app":app,"reason":reason,"usedMinutes":used/60,"limitMinutes":limit/60})); }
     }
-    fn close_pid(&mut self, pid: u32, exe: &str, reason: &str) {
+    fn close_matching_exe(&mut self, exe: &str, reason: &str) {
         if !safe_exe(exe) { return; }
+        let pids: Vec<u32> = enumerate_processes().into_iter()
+            .filter(|p| p.exe.eq_ignore_ascii_case(exe))
+            .map(|p| p.pid)
+            .collect();
+        for pid in pids { terminate_process_tree(pid, exe); }
 
-        #[cfg(windows)]
-        {
-            use windows::Win32::Foundation::CloseHandle;
-            use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
-            unsafe {
-                match OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-                    Ok(handle) => {
-                        if let Err(error) = TerminateProcess(handle, 1) {
-                            eprintln!("Failed to terminate pid {pid} ({exe}): {error:?}");
-                        }
-                        let _ = CloseHandle(handle);
-                    }
-                    Err(error) => eprintln!("Failed to open pid {pid} ({exe}) for termination: {error:?}"),
-                }
-            }
-
-            for _ in 0..10 {
-                if !process_exists(pid) { break; }
-                thread::sleep(Duration::from_millis(50));
-            }
-            if process_exists(pid) {
-                eprintln!("Liba Bilancia could not confirm that pid {pid} ({exe}) exited.");
-            }
-        }
-
-        #[cfg(not(windows))]
-        {
-            let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
-        }
+        let should_finish = self.active.as_ref().map(|active| active.exe.eq_ignore_ascii_case(exe) || !process_exists(active.pid)).unwrap_or(false);
+        if should_finish { self.finish_active(); self.active = None; self.data.current_app = None; self.data.current_exe = None; self.data.current_category = None; self.data.current_session_secs = 0; }
 
         let (used, limit) = self.data.settings.appLimits.get(exe).map(|rule| (self.usage_for_rule(exe, rule), u64::from(rule.dailyMinutes).saturating_mul(60))).unwrap_or((0,0));
-        self.emit_limit(exe.to_string(), exe.to_string(), reason.to_string(), used, limit);
-        self.finish_active();
-        self.active = None;
-        self.data.current_app = None; self.data.current_exe = None; self.data.current_category = None; self.data.current_session_secs = 0;
+        self.emit_limit(exe.to_string(), friendly_process_name(exe), reason.to_string(), used, limit);
+    }
+    fn close_pid(&mut self, pid: u32, exe: &str, reason: &str) {
+        if !safe_exe(exe) { return; }
+        terminate_process_tree(pid, exe);
+        let should_finish = self.active.as_ref().map(|active| active.pid == pid || (active.exe.eq_ignore_ascii_case(exe) && !process_exists(active.pid))).unwrap_or(false);
+        if should_finish { self.finish_active(); self.active = None; self.data.current_app = None; self.data.current_exe = None; self.data.current_category = None; self.data.current_session_secs = 0; }
+        let (used, limit) = self.data.settings.appLimits.get(exe).map(|rule| (self.usage_for_rule(exe, rule), u64::from(rule.dailyMinutes).saturating_mul(60))).unwrap_or((0,0));
+        self.emit_limit(exe.to_string(), friendly_process_name(exe), reason.to_string(), used, limit);
     }
 }
 
@@ -422,6 +429,60 @@ fn process_exists(pid: u32) -> bool {
         }
     }
     #[cfg(not(windows))] { let _ = pid; false }
+}
+
+
+#[derive(Clone, Debug)]
+struct ProcessInfo { pid: u32, exe: String }
+
+#[cfg(windows)]
+fn enumerate_processes() -> Vec<ProcessInfo> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    let Ok(snapshot) = snapshot else { return Vec::new(); };
+    let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+    let mut result = Vec::new();
+    unsafe {
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let end = entry.szExeFile.iter().position(|c| *c == 0).unwrap_or(entry.szExeFile.len());
+                let exe = String::from_utf16_lossy(&entry.szExeFile[..end]);
+                if entry.th32ProcessID != 0 && safe_exe(&exe) { result.push(ProcessInfo { pid: entry.th32ProcessID, exe }); }
+                if Process32NextW(snapshot, &mut entry).is_err() { break; }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn enumerate_processes() -> Vec<ProcessInfo> { Vec::new() }
+
+#[cfg(windows)]
+fn terminate_process_tree(pid: u32, exe: &str) {
+    if !safe_exe(exe) || pid == 0 { return; }
+    let killed = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if killed { return; }
+
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
+    unsafe {
+        if let Ok(handle) = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            let _ = TerminateProcess(handle, 1);
+            let _ = CloseHandle(handle);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn terminate_process_tree(pid: u32, _exe: &str) {
+    let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
 }
 
 #[derive(Clone)]
@@ -572,8 +633,81 @@ fn running_apps_for_windows() -> Vec<RunningApp> {
 #[cfg(not(windows))]
 fn running_apps_for_windows() -> Vec<RunningApp> { Vec::new() }
 
+
+#[cfg(windows)]
+fn installed_apps_for_windows() -> Vec<RunningApp> {
+    let script = r#"
+$roots = @(
+  "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
+  "$env:ProgramData\Microsoft\Windows\Start Menu\Programs"
+) | Where-Object { Test-Path $_ } | Select-Object -Unique
+$ws = New-Object -ComObject WScript.Shell
+$items = foreach ($root in $roots) {
+  Get-ChildItem -Path $root -Filter *.lnk -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+    try {
+      $shortcut = $ws.CreateShortcut($_.FullName)
+      $target = $shortcut.TargetPath
+      if ($target -and [IO.Path]::GetExtension($target) -ieq '.exe' -and ($target -notlike "$env:WINDIR\*")) {
+        $exe = [IO.Path]::GetFileName($target)
+        if ($exe -notmatch '^(?i:uninstall|unins.*|setup|update|updater|bootstrapper).*\.exe$') {
+          [PSCustomObject]@{ Name = $_.BaseName; Exe = $exe }
+        }
+      }
+    } catch {}
+  }
+}
+@($items | Where-Object { $_.Exe }) | Sort-Object Exe -Unique | ConvertTo-Json -Compress
+"#;
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .output();
+    let Ok(output) = output else { return Vec::new(); };
+    if !output.status.success() { return Vec::new(); }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap_or(serde_json::Value::Array(Vec::new()));
+    let array = match value { serde_json::Value::Array(items) => items, serde_json::Value::Object(_) => vec![value], _ => Vec::new() };
+    let mut apps = Vec::new();
+    for item in array {
+        let Some(exe) = item.get("Exe").and_then(|v| v.as_str()) else { continue; };
+        let name = item.get("Name").and_then(|v| v.as_str()).unwrap_or(exe);
+        if safe_exe(exe) { apps.push(RunningApp { name: if name.trim().is_empty() { friendly_process_name(exe) } else { name.to_string() }, exe: exe.to_string() }); }
+    }
+    apps
+}
+
+#[cfg(not(windows))]
+fn installed_apps_for_windows() -> Vec<RunningApp> { Vec::new() }
+
+fn protection_apps_for_windows() -> Vec<RunningApp> {
+    let mut merged: HashMap<String, RunningApp> = HashMap::new();
+    for app in running_apps_for_windows().into_iter().chain(installed_apps_for_windows()) {
+        if !safe_exe(&app.exe) { continue; }
+        let key = app.exe.to_ascii_lowercase();
+        merged.entry(key).or_insert(app);
+    }
+    for app in [
+        RunningApp { name: "Google Chrome".into(), exe: "chrome.exe".into() },
+        RunningApp { name: "Microsoft Edge".into(), exe: "msedge.exe".into() },
+        RunningApp { name: "Mozilla Firefox".into(), exe: "firefox.exe".into() },
+        RunningApp { name: "Discord".into(), exe: "discord.exe".into() },
+        RunningApp { name: "Spotify".into(), exe: "spotify.exe".into() },
+        RunningApp { name: "Steam".into(), exe: "steam.exe".into() },
+        RunningApp { name: "Telegram".into(), exe: "telegram.exe".into() },
+        RunningApp { name: "VLC media player".into(), exe: "vlc.exe".into() },
+    ] {
+        merged.entry(app.exe.to_ascii_lowercase()).or_insert(app);
+    }
+    let mut result: Vec<RunningApp> = merged.into_values().collect();
+    result.sort_by(|a,b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+    result
+}
+
+#[tauri::command]
+fn get_protection_apps() -> Vec<RunningApp> { protection_apps_for_windows() }
+
 #[tauri::command]
 fn get_running_apps() -> Vec<RunningApp> { running_apps_for_windows() }
+
 
 #[tauri::command]
 fn get_tracker_data(state: State<AppState>) -> TrackerData { state.0.lock().unwrap().current_data() }
@@ -641,7 +775,8 @@ fn set_focus_protection(_app: AppHandle, state: State<AppState>, active: bool, b
 fn force_close_policy_target(state: State<AppState>, pid: u32, exe: String) -> Result<(), String> {
     let mut tracker = state.0.lock().map_err(|_| "tracker lock failed")?;
     if !safe_exe(&exe) { return Err("That process is not an allowed protection target.".into()); }
-    tracker.close_pid(pid, &exe, "Closed by Liba Bilancia warning");
+    terminate_process_tree(pid, &exe);
+    tracker.close_matching_exe(&exe, "Closed by Liba Bilancia warning");
     tracker.warning_active = None;
     hide_limit_overlay();
     Ok(())
@@ -668,7 +803,7 @@ fn save_app_limit(state: State<AppState>, exe: String, limit: AppLimit) -> Resul
         expiresAt: limit.expiresAt,
     };
     tracker.data.settings.appLimits.insert(exe.clone(), normalized);
-    tracker.warn_pending.remove(&exe.to_ascii_lowercase());
+    tracker.warn_observed.remove(&exe.to_ascii_lowercase());
     tracker.warn_reopen_counts.remove(&exe.to_ascii_lowercase());
     tracker.warning_active = None;
     tracker.persist();
@@ -780,7 +915,7 @@ pub fn run() {
             #[cfg(windows)]
             { thread::spawn(start_windows_hook); }
             thread::spawn(|| loop {
-                thread::sleep(Duration::from_secs(5));
+                thread::sleep(Duration::from_secs(1));
                 if let Some(shared)=GLOBAL_TRACKER.get() {
                     if let Ok(mut tracker)=shared.lock() {
                         tracker.refresh_foreground();
@@ -791,7 +926,7 @@ pub fn run() {
             Ok(())
         });
     builder.invoke_handler(tauri::generate_handler![
-        get_tracker_data, get_running_apps, save_settings, save_category, set_tracking_paused,
+        get_tracker_data, get_running_apps, get_protection_apps, save_settings, save_category, set_tracking_paused,
         complete_focus_session, set_focus_protection, force_close_policy_target,
         close_policy_overlay, save_app_limit, remove_app_limit, purchase_reward,
         equip_reward, delete_local_data, export_local_data, hide_to_tray, quit_app

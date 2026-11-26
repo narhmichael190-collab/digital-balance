@@ -25,6 +25,35 @@ export const supabase: SupabaseClient | null = supabaseConfigured
     })
   : null;
 
+export async function signInWithAzure() {
+  if (!supabase) throw new Error('Supabase is not configured yet.');
+  const { data, error } = await supabase.auth.signInWithOAuth({
+    provider: 'azure',
+    options: {
+      redirectTo: 'digitalbalance://auth/callback',
+      skipBrowserRedirect: true,
+      scopes: 'email',
+    },
+  });
+  if (error) throw error;
+  if (data.url) await openUrl(data.url);
+}
+
+export async function signInWithEmailPassword(email: string, password: string) {
+  if (!supabase) throw new Error('Supabase is not configured yet.');
+  const cleanEmail = email.trim();
+  if (!cleanEmail || !password) throw new Error('Enter your email and password.');
+  const { error } = await supabase.auth.signInWithPassword({ email: cleanEmail, password });
+  if (error) throw error;
+}
+
+export async function updatePassword(password: string) {
+  if (!supabase) throw new Error('Supabase is not configured yet.');
+  if (password.length < 8) throw new Error('Use a password with at least 8 characters.');
+  const { error } = await supabase.auth.updateUser({ password });
+  if (error) throw error;
+}
+
 export async function signInWithGoogle() {
   if (!supabase) throw new Error('Supabase is not configured yet.');
   const { data, error } = await supabase.auth.signInWithOAuth({

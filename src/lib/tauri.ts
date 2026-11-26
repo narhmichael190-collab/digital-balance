@@ -3,6 +3,7 @@ import type { AppLimit, AppSettings, RunningApp, TrackerData } from './types';
 
 export async function getTrackerData() { return invoke<TrackerData>('get_tracker_data'); }
 export async function getRunningApps() { return invoke<RunningApp[]>('get_running_apps'); }
+export async function getProtectionApps() { return invoke<RunningApp[]>('get_protection_apps'); }
 export async function saveSettings(settings: AppSettings) { return invoke<TrackerData>('save_settings', { settings }); }
 export async function saveCategory(exe: string, category: string) { return invoke<TrackerData>('save_category', { exe, category }); }
 export async function setTrackingPaused(paused: boolean) { return invoke<TrackerData>('set_tracking_paused', { paused }); }

@@ -899,3 +899,26 @@ h1,h2,h3,.hero-title-row strong,.section-label{font-family:var(--display-font)}
   color: #172338;
 }
 
+
+/* V1.6 control + authentication upgrade */
+.app-protection-picker{display:grid;gap:10px}
+.protection-app-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;max-height:320px;overflow:auto;padding-right:2px}
+.protection-app-option{min-width:0;display:grid;grid-template-columns:1fr auto;grid-template-areas:"name check" "exe exe";gap:2px 8px;text-align:left;padding:10px 11px;border:1px solid var(--line);border-radius:11px;background:var(--panel2);color:var(--text);cursor:pointer;transition:.15s ease}
+.protection-app-option:hover{border-color:color-mix(in srgb,var(--accent) 45%,var(--line));transform:translateY(-1px)}
+.protection-app-option.selected{border-color:color-mix(in srgb,var(--accent) 70%,var(--line));box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 16%,transparent),0 8px 20px color-mix(in srgb,var(--accent) 8%,transparent);background:color-mix(in srgb,var(--accent) 7%,var(--panel2))}
+.protection-app-option span{grid-area:name;font-size:11px;font-weight:850;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.protection-app-option small{grid-area:exe;color:var(--muted);font-size:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.protection-app-option b{grid-area:check;color:var(--accent);font-size:13px}
+.selected-protection-app{display:grid;gap:2px;padding:10px 12px;border:1px solid color-mix(in srgb,var(--accent) 24%,var(--line));border-radius:11px;background:color-mix(in srgb,var(--accent) 5%,var(--panel2))}
+.selected-protection-app span,.selected-protection-app small{color:var(--muted);font-size:8px}
+.selected-protection-app strong{font-size:12px}
+.auth-card{width:min(520px,calc(100vw - 40px))}
+.auth-provider-grid{display:grid;gap:9px;margin-top:18px}
+.auth-provider-grid button{margin-top:0}
+.outlook-btn,.email-login-btn{width:100%;display:flex;align-items:center;justify-content:center;gap:8px;padding:12px;border-radius:10px;font-weight:850;border:1px solid var(--line);cursor:pointer}
+.outlook-btn{background:#eef6ff;color:#172338}.email-login-btn{background:var(--panel2);color:var(--text)}
+.provider-glyph{width:22px;height:22px;display:grid;place-items:center;border-radius:5px;font-weight:900}.google-glyph{background:#fff;color:#4285f4}.outlook-glyph{background:#0f6cbd;color:#fff}
+.auth-divider{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:9px;margin:2px 0}.auth-divider::before,.auth-divider::after{content:"";height:1px;flex:1;background:var(--line)}
+.email-login-panel{display:grid;gap:10px;margin-top:18px}.email-login-panel .wide{width:100%;margin-top:0}
+.security-panel{grid-column:span 2}
+@media(max-width:900px){.protection-app-grid{grid-template-columns:1fr}.security-panel{grid-column:auto}}
