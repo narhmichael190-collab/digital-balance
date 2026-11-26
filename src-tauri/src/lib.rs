@@ -1,9 +1,9 @@
-#![allow(non_snake_case)]
+﻿#![allow(non_snake_case)]
 
 use chrono::{DateTime, Local, Utc};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, HashSet}, fs, path::PathBuf, sync::{Arc, Mutex}, thread, time::Duration};
+use std::{collections::{HashMap, HashSet}, fs, path::PathBuf, sync::{Arc, Mutex}, thread, time::{Duration, Instant}};
 use tauri::{
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder,
     menu::{MenuBuilder, MenuItemBuilder},
@@ -21,12 +21,12 @@ impl Default for AppMode { fn default() -> Self { Self::Smart } }
 pub enum Category { Productive, Distracting, Communication, Media, Neutral }
 impl Default for Category { fn default() -> Self { Self::Neutral } }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum LimitAction { Warn, Close, Block }
 impl Default for LimitAction { fn default() -> Self { Self::Block } }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LimitScope { Daily, UntilDate }
 impl Default for LimitScope { fn default() -> Self { Self::Daily } }
 
@@ -118,18 +118,34 @@ impl Default for TrackerData {
 struct ActiveSession { exe: String, app_name: String, category: Category, pid: u32, started: DateTime<Utc> }
 
 #[derive(Debug)]
-struct Tracker { data: TrackerData, path: PathBuf, active: Option<ActiveSession>, focus_active: bool, focus_mode: Option<AppMode>, focus_started: Option<DateTime<Utc>>, focus_apps: HashSet<String>, casual_focus_started: HashMap<String, DateTime<Utc>>, warn_observed: HashSet<String>, warn_reopen_counts: HashMap<String, u8>, warning_active: Option<(String, u32)>, closed_date: String }
+struct Tracker { data: TrackerData, path: PathBuf, active: Option<ActiveSession>, focus_active: bool, focus_mode: Option<AppMode>, focus_started: Option<DateTime<Utc>>, focus_apps: HashSet<String>, casual_focus_started: HashMap<String, DateTime<Utc>>, warn_observed: HashSet<String>, warn_reopen_counts: HashMap<String, u8>, warning_active: Option<(String, u32)>, close_triggered: HashSet<String>, wellbeing_records: Vec<WellbeingRecord>, wellbeing_active: Option<ActiveWellbeing>, closed_date: String }
 
 #[derive(Clone)]
 pub struct AppState(Arc<Mutex<Tracker>>);
 static GLOBAL_TRACKER: OnceCell<Arc<Mutex<Tracker>>> = OnceCell::new();
 static GLOBAL_APP: OnceCell<AppHandle> = OnceCell::new();
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WellbeingRecord {
+    pub id: String,
+    pub completed_at: String,
+    pub duration_secs: u64,
+    pub coins: u32,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveWellbeing {
+    id: String,
+    started: Instant,
+    completed_steps: u8,
+}
+
 fn local_day() -> String { Local::now().date_naive().to_string() }
 
 fn safe_exe(exe: &str) -> bool {
     let lower = exe.to_ascii_lowercase();
     if exe.is_empty() || exe.len() > 160 { return false; }
+    if !lower.ends_with(".exe") { return false; }
     if !exe.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')) { return false; }
     !matches!(lower.as_str(),
         "system" | "system idle process" | "smss.exe" | "csrss.exe" | "wininit.exe" | "winlogon.exe" |
@@ -141,6 +157,40 @@ fn safe_exe(exe: &str) -> bool {
         "wmiprvse.exe" | "searchindexer.exe" | "spoolsv.exe" | "smartscreen.exe" |
         "msedgewebview2.exe" | "backgroundtaskhost.exe" | "widgetservice.exe" | "widgets.exe" |
         "securityhealthservice.exe" | "securityhealthsystray.exe" | "audiodg.exe")
+}
+
+fn normalize_exe_target(exe: &str) -> String {
+    std::path::Path::new(exe)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase()
+}
+
+fn wellbeing_duration_secs(id: &str) -> Option<u64> {
+    match id {
+        "box-breathing" => Some(180),
+        "grounding-5" => Some(240),
+        "desk-stretch" => Some(360),
+        "morning-flow" => Some(480),
+        "march-break" => Some(300),
+        "balance-break" => Some(240),
+        "walk-reset" => Some(600),
+        "desk-reset" => Some(180),
+        _ => None,
+    }
+}
+
+fn wellbeing_coins(duration_secs: u64) -> u32 {
+    (duration_secs / 60).saturating_mul(2).clamp(1, 20) as u32
+}
+
+fn wellbeing_day_records(records: &[WellbeingRecord]) -> Vec<WellbeingRecord> {
+    let today = local_day();
+    records.iter()
+        .filter(|r| r.completed_at.get(..10).unwrap_or("") == today)
+        .cloned()
+        .collect()
 }
 
 fn free_theme_ids() -> Vec<String> {
@@ -188,13 +238,13 @@ impl Tracker {
         data.settings.ownedRewards = owned;
         if data.settings.displayName.trim().is_empty() || data.settings.displayName == "Digital Balance" { data.settings.displayName = "Liba Bilancia".into(); }
         if data.settings.theme.is_empty() { data.settings.theme = "theme:obsidian".into(); }
-        Self { data, path, active: None, focus_active: false, focus_mode: None, focus_started: None, focus_apps: HashSet::new(), casual_focus_started: HashMap::new(), warn_observed: HashSet::new(), warn_reopen_counts: HashMap::new(), warning_active: None, closed_date: local_day() }
+        Self { data, path, active: None, focus_active: false, focus_mode: None, focus_started: None, focus_apps: HashSet::new(), casual_focus_started: HashMap::new(), warn_observed: HashSet::new(), warn_reopen_counts: HashMap::new(), warning_active: None, close_triggered: HashSet::new(), wellbeing_records: Vec::new(), wellbeing_active: None, closed_date: local_day() }
     }
     fn persist(&self) {
         if let Some(parent) = self.path.parent() { let _ = fs::create_dir_all(parent); }
         if let Ok(raw) = serde_json::to_string_pretty(&self.data) { let _ = fs::write(&self.path, raw); }
     }
-    fn normalize_day(&mut self) { let now = local_day(); if now != self.closed_date { self.closed_date = now; self.warn_observed.clear(); self.warn_reopen_counts.clear(); self.warning_active = None; hide_limit_overlay(); } }
+    fn normalize_day(&mut self) { let now = local_day(); if now != self.closed_date { self.closed_date = now; self.warn_observed.clear(); self.warn_reopen_counts.clear(); self.close_triggered.clear(); self.warning_active = None; hide_limit_overlay(); } }
     fn category_for(&self, exe: &str) -> Category {
         self.data.settings.categoryOverrides.get(exe).cloned().unwrap_or_else(|| auto_category(exe))
     }
@@ -283,10 +333,15 @@ impl Tracker {
 
         let processes = enumerate_processes();
         let running_exes: HashSet<String> = processes.iter().map(|p| p.exe.to_ascii_lowercase()).collect();
-        self.warn_observed.retain(|key| running_exes.contains(key));
+        let visible_pids = enumerate_visible_process_ids();
+        let visible_exes: HashSet<String> = processes.iter()
+            .filter(|p| visible_pids.contains(&p.pid))
+            .map(|p| p.exe.to_ascii_lowercase())
+            .collect();
+        self.warn_observed.retain(|key| visible_exes.contains(key));
 
         if let Some((warning_exe, warning_pid)) = self.warning_active.clone() {
-            if !running_exes.contains(&warning_exe) || !process_exists(warning_pid) {
+            if !visible_exes.contains(&warning_exe) || !process_exists(warning_pid) {
                 self.warning_active = None;
                 hide_limit_overlay();
             }
@@ -330,6 +385,7 @@ impl Tracker {
             let key = configured_exe.to_ascii_lowercase();
             let matches: Vec<ProcessInfo> = processes.iter().filter(|p| p.exe.eq_ignore_ascii_case(&configured_exe)).cloned().collect();
             if matches.is_empty() { continue; }
+            let visible_matches: Vec<ProcessInfo> = matches.iter().filter(|p| visible_pids.contains(&p.pid)).cloned().collect();
 
             let used_seconds = self.usage_for_rule(&configured_exe, &rule);
             let limit_seconds = u64::from(rule.dailyMinutes).saturating_mul(60);
@@ -337,7 +393,7 @@ impl Tracker {
 
             match rule.action {
                 LimitAction::Warn => {
-                    if !self.warn_observed.contains(&key) {
+                    if !self.warn_observed.contains(&key) && !visible_matches.is_empty() {
                         // End the mutable borrow from the warning-count map before
                         // borrowing `self` again for enforcement/UI work.
                         let count = {
@@ -349,18 +405,18 @@ impl Tracker {
                         self.warn_observed.insert(key.clone());
 
                         if count > 3 {
-                            self.close_matching_exe(&configured_exe, "Three warnings used — protection is now blocking this app");
+                            self.close_matching_exe(&configured_exe, "Three warnings used â€” protection is now blocking this app");
                             self.warning_active = None;
                             hide_limit_overlay();
                         } else {
-                            let pid = matches[0].pid;
+                            let pid = visible_matches[0].pid;
                             self.warning_active = Some((key.clone(), pid));
                             let app_name = friendly_process_name(&configured_exe);
                             show_limit_overlay(&configured_exe, &app_name, pid, count);
                             self.emit_limit(
                                 configured_exe.clone(),
                                 app_name,
-                                format!("Warning {} of 3 — close this app to continue", count),
+                                format!("Warning {} of 3 â€” close this app to continue", count),
                                 used_seconds,
                                 limit_seconds,
                             );
@@ -368,10 +424,13 @@ impl Tracker {
                     }
                 }
                 LimitAction::Close => {
-                    self.close_matching_exe(&configured_exe, "Limit reached — app closed");
+                    if !self.close_triggered.contains(&key) {
+                        self.close_triggered.insert(key.clone());
+                        self.close_matching_exe(&configured_exe, "Limit reached - app closed");
+                    }
                 }
                 LimitAction::Block => {
-                    self.close_matching_exe(&configured_exe, "Limit reached — app blocked until the rule resets");
+                    self.close_matching_exe(&configured_exe, "Limit reached - app blocked until the rule resets");
                 }
             }
         }
@@ -542,7 +601,7 @@ unsafe extern "system" fn win_event_proc(_: windows::Win32::UI::Accessibility::H
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RunningApp { name: String, exe: String }
+struct RunningApp { name: String, exe: String, installed: bool }
 
 fn friendly_process_name(exe: &str) -> String {
     match exe.to_ascii_lowercase().as_str() {
@@ -604,6 +663,9 @@ fn enumerate_visible_process_ids() -> HashSet<u32> {
     ids
 }
 
+#[cfg(not(windows))]
+fn enumerate_visible_process_ids() -> HashSet<u32> { HashSet::new() }
+
 #[cfg(windows)]
 fn running_apps_for_windows() -> Vec<RunningApp> {
     use windows::Win32::Foundation::CloseHandle;
@@ -622,7 +684,7 @@ fn running_apps_for_windows() -> Vec<RunningApp> {
             let exe = std::path::Path::new(&path).file_name().unwrap_or_default().to_string_lossy().to_string();
             if !safe_exe(&exe) { continue; }
             let key = exe.to_ascii_lowercase();
-            apps.entry(key).or_insert_with(|| RunningApp { name: friendly_process_name(&exe), exe });
+            apps.entry(key).or_insert_with(|| RunningApp { name: friendly_process_name(&exe), exe, installed: false });
         }
     }
     let mut result: Vec<RunningApp> = apps.into_values().collect();
@@ -639,7 +701,9 @@ fn installed_apps_for_windows() -> Vec<RunningApp> {
     let script = r#"
 $roots = @(
   "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
-  "$env:ProgramData\Microsoft\Windows\Start Menu\Programs"
+  "$env:USERPROFILE\Desktop",
+  "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
+  "$env:PUBLIC\Desktop"
 ) | Where-Object { Test-Path $_ } | Select-Object -Unique
 $ws = New-Object -ComObject WScript.Shell
 $items = foreach ($root in $roots) {
@@ -670,7 +734,7 @@ $items = foreach ($root in $roots) {
     for item in array {
         let Some(exe) = item.get("Exe").and_then(|v| v.as_str()) else { continue; };
         let name = item.get("Name").and_then(|v| v.as_str()).unwrap_or(exe);
-        if safe_exe(exe) { apps.push(RunningApp { name: if name.trim().is_empty() { friendly_process_name(exe) } else { name.to_string() }, exe: exe.to_string() }); }
+        if safe_exe(exe) { apps.push(RunningApp { name: if name.trim().is_empty() { friendly_process_name(exe) } else { name.to_string() }, exe: exe.to_string(), installed: true }); }
     }
     apps
 }
@@ -686,14 +750,14 @@ fn protection_apps_for_windows() -> Vec<RunningApp> {
         merged.entry(key).or_insert(app);
     }
     for app in [
-        RunningApp { name: "Google Chrome".into(), exe: "chrome.exe".into() },
-        RunningApp { name: "Microsoft Edge".into(), exe: "msedge.exe".into() },
-        RunningApp { name: "Mozilla Firefox".into(), exe: "firefox.exe".into() },
-        RunningApp { name: "Discord".into(), exe: "discord.exe".into() },
-        RunningApp { name: "Spotify".into(), exe: "spotify.exe".into() },
-        RunningApp { name: "Steam".into(), exe: "steam.exe".into() },
-        RunningApp { name: "Telegram".into(), exe: "telegram.exe".into() },
-        RunningApp { name: "VLC media player".into(), exe: "vlc.exe".into() },
+        RunningApp { name: "Google Chrome".into(), exe: "chrome.exe".into(), installed: false },
+        RunningApp { name: "Microsoft Edge".into(), exe: "msedge.exe".into(), installed: false },
+        RunningApp { name: "Mozilla Firefox".into(), exe: "firefox.exe".into(), installed: false },
+        RunningApp { name: "Discord".into(), exe: "discord.exe".into(), installed: false },
+        RunningApp { name: "Spotify".into(), exe: "spotify.exe".into(), installed: false },
+        RunningApp { name: "Steam".into(), exe: "steam.exe".into(), installed: false },
+        RunningApp { name: "Telegram".into(), exe: "telegram.exe".into(), installed: false },
+        RunningApp { name: "VLC media player".into(), exe: "vlc.exe".into(), installed: false },
     ] {
         merged.entry(app.exe.to_ascii_lowercase()).or_insert(app);
     }
@@ -717,7 +781,14 @@ fn save_settings(app: AppHandle, state: State<AppState>, mut settings: AppSettin
     let arc = state.0.clone();
     settings.displayName = settings.displayName.trim().chars().take(28).collect();
     if settings.displayName.is_empty() { settings.displayName = "Liba Bilancia".into(); }
-    { let mut tracker = arc.lock().unwrap(); tracker.data.settings = settings.clone(); tracker.persist(); }
+    { let mut tracker = arc.lock().unwrap();
+        let coins = tracker.data.settings.coins;
+        let owned_rewards = tracker.data.settings.ownedRewards.clone();
+        settings.coins = coins;
+        settings.ownedRewards = owned_rewards;
+        tracker.data.settings = settings.clone();
+        tracker.persist();
+    }
     let manager = app.autolaunch();
     if settings.autostartEnabled { let _ = manager.enable(); } else { let _ = manager.disable(); }
     let data = { let mut tracker = arc.lock().unwrap(); tracker.current_data() };
@@ -763,7 +834,7 @@ fn set_focus_protection(_app: AppHandle, state: State<AppState>, active: bool, b
     tracker.focus_active = active;
     tracker.focus_mode = if active { Some(match mode.as_str() { "Deep Focus" => AppMode::DeepFocus, "Casual" => AppMode::Casual, _ => AppMode::Smart }) } else { None };
     tracker.focus_started = if active { Some(Utc::now()) } else { None };
-    tracker.focus_apps = blockedApps.into_iter().map(|x| x.to_ascii_lowercase()).filter(|x| safe_exe(x)).collect();
+    tracker.focus_apps = blockedApps.into_iter().map(|x| normalize_exe_target(&x)).filter(|x| safe_exe(x)).collect();
     tracker.casual_focus_started.clear();
     tracker.data.settings.deepFocusBlockedApps = tracker.focus_apps.iter().cloned().collect();
     tracker.persist();
@@ -802,9 +873,12 @@ fn save_app_limit(state: State<AppState>, exe: String, limit: AppLimit) -> Resul
         startedAt: Some(Utc::now().to_rfc3339()),
         expiresAt: limit.expiresAt,
     };
-    tracker.data.settings.appLimits.insert(exe.clone(), normalized);
-    tracker.warn_observed.remove(&exe.to_ascii_lowercase());
-    tracker.warn_reopen_counts.remove(&exe.to_ascii_lowercase());
+    let key = normalize_exe_target(&exe);
+    tracker.data.settings.appLimits.retain(|existing, _| normalize_exe_target(existing) != key);
+    tracker.data.settings.appLimits.insert(key.clone(), normalized);
+    tracker.warn_observed.remove(&key);
+    tracker.warn_reopen_counts.remove(&key);
+    tracker.close_triggered.remove(&key);
     tracker.warning_active = None;
     tracker.persist();
     tracker.enforce_active();
@@ -812,7 +886,17 @@ fn save_app_limit(state: State<AppState>, exe: String, limit: AppLimit) -> Resul
 }
 
 #[tauri::command]
-fn remove_app_limit(state: State<AppState>, exe: String) -> TrackerData { let mut tracker=state.0.lock().unwrap(); tracker.data.settings.appLimits.remove(&exe); tracker.persist(); tracker.current_data() }
+fn remove_app_limit(state: State<AppState>, exe: String) -> TrackerData {
+    let mut tracker=state.0.lock().unwrap();
+    let key = normalize_exe_target(&exe);
+    let existing = tracker.data.settings.appLimits.keys().find(|k| normalize_exe_target(k) == key).cloned();
+    if let Some(existing) = existing { tracker.data.settings.appLimits.remove(&existing); }
+    tracker.close_triggered.remove(&key);
+    tracker.warn_observed.remove(&key);
+    tracker.warn_reopen_counts.remove(&key);
+    tracker.persist();
+    tracker.current_data()
+}
 
 #[tauri::command]
 fn purchase_reward(state: State<AppState>, rewardId: String) -> Result<TrackerData, String> {
@@ -837,6 +921,66 @@ fn equip_reward(state: State<AppState>, rewardId: String) -> Result<TrackerData,
     tracker.persist(); Ok(tracker.current_data())
 }
 
+fn wellbeing_progress(active: &ActiveWellbeing, duration: u64) -> u8 {
+    let elapsed = active.started.elapsed().as_secs();
+    ((elapsed.saturating_mul(100) / duration.max(1)).min(100)) as u8
+}
+
+#[tauri::command]
+fn get_wellbeing_records(state: State<AppState>) -> Vec<WellbeingRecord> {
+    state.0.lock().unwrap().wellbeing_records.clone()
+}
+
+#[tauri::command]
+fn start_wellbeing_activity(state: State<AppState>, id: String) -> Result<serde_json::Value, String> {
+    let duration = wellbeing_duration_secs(&id).ok_or_else(|| "Unknown wellbeing activity.".to_string())?;
+    let mut tracker = state.0.lock().map_err(|_| "tracker lock failed")?;
+    let today = wellbeing_day_records(&tracker.wellbeing_records);
+    if today.len() >= 3 { return Err("Daily wellbeing reward limit reached.".into()); }
+    if today.iter().filter(|r| r.id == id).count() >= 2 { return Err("You have already completed this activity twice today.".into()); }
+    if tracker.wellbeing_active.is_some() { return Err("A wellbeing activity is already running.".into()); }
+    tracker.wellbeing_active = Some(ActiveWellbeing { id: id.clone(), started: Instant::now(), completed_steps: 0 });
+    Ok(serde_json::json!({"id":id,"durationSecs":duration,"completedSteps":0,"progress":0}))
+}
+
+#[tauri::command]
+fn advance_wellbeing_step(state: State<AppState>) -> Result<serde_json::Value, String> {
+    let mut tracker = state.0.lock().map_err(|_| "tracker lock failed")?;
+    let Some(active) = tracker.wellbeing_active.as_mut() else { return Err("No wellbeing activity is running.".into()); };
+    let duration = wellbeing_duration_secs(&active.id).unwrap_or(180);
+    let progress = wellbeing_progress(active, duration);
+    let required = match active.completed_steps { 0 => 25, 1 => 50, 2 => 75, _ => 100 };
+    if progress < required { return Err(format!("Complete at least {}% of the activity before continuing.", required)); }
+    if active.completed_steps < 3 { active.completed_steps += 1; }
+    Ok(serde_json::json!({"id":active.id,"durationSecs":duration,"completedSteps":active.completed_steps,"progress":progress}))
+}
+
+#[tauri::command]
+fn cancel_wellbeing_activity(state: State<AppState>) -> Result<(), String> {
+    let mut tracker = state.0.lock().map_err(|_| "tracker lock failed")?;
+    tracker.wellbeing_active = None;
+    Ok(())
+}
+
+#[tauri::command]
+fn complete_wellbeing_activity(state: State<AppState>) -> Result<serde_json::Value, String> {
+    let mut tracker = state.0.lock().map_err(|_| "tracker lock failed")?;
+    let Some(active) = tracker.wellbeing_active.clone() else { return Err("No wellbeing activity is running.".into()); };
+    let duration = wellbeing_duration_secs(&active.id).unwrap_or(180);
+    let progress = wellbeing_progress(&active, duration);
+    if progress < 100 || active.completed_steps < 3 { return Err("Finish the full activity and all steps first.".into()); }
+    let today = wellbeing_day_records(&tracker.wellbeing_records);
+    if today.len() >= 3 { tracker.wellbeing_active = None; return Err("Daily wellbeing reward limit reached.".into()); }
+    if today.iter().filter(|r| r.id == active.id).count() >= 2 { tracker.wellbeing_active = None; return Err("This activity has already been rewarded twice today.".into()); }
+    let coins = wellbeing_coins(duration);
+    let record = WellbeingRecord { id: active.id.clone(), completed_at: Utc::now().to_rfc3339(), duration_secs: duration, coins };
+    tracker.wellbeing_records.push(record.clone());
+    tracker.data.settings.coins = tracker.data.settings.coins.saturating_add(coins);
+    tracker.wellbeing_active = None;
+    if tracker.wellbeing_records.len() > 1000 { let drain = tracker.wellbeing_records.len() - 1000; tracker.wellbeing_records.drain(0..drain); }
+    tracker.persist();
+    Ok(serde_json::json!({"record":record,"coins":coins,"data":tracker.current_data()}))
+}
 #[tauri::command]
 fn delete_local_data(state: State<AppState>) -> TrackerData { let mut tracker=state.0.lock().unwrap(); tracker.data.sessions.clear(); tracker.data.focus_sessions.clear(); tracker.data.settings.appLimits.clear(); tracker.data.current_app=None; tracker.data.current_exe=None; tracker.data.current_category=None; tracker.data.current_session_secs=0; tracker.persist(); tracker.current_data() }
 #[tauri::command]
@@ -878,7 +1022,7 @@ pub fn run() {
                 .expect("Liba Bilancia default icon is required for the system tray");
             TrayIconBuilder::with_id("digital-balance-tray")
                 .icon(tray_icon)
-                .tooltip("Liba Bilancia — running in the background")
+                .tooltip("Liba Bilancia â€” running in the background")
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
@@ -915,7 +1059,7 @@ pub fn run() {
             #[cfg(windows)]
             { thread::spawn(start_windows_hook); }
             thread::spawn(|| loop {
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(Duration::from_millis(500));
                 if let Some(shared)=GLOBAL_TRACKER.get() {
                     if let Ok(mut tracker)=shared.lock() {
                         tracker.refresh_foreground();
@@ -929,8 +1073,10 @@ pub fn run() {
         get_tracker_data, get_running_apps, get_protection_apps, save_settings, save_category, set_tracking_paused,
         complete_focus_session, set_focus_protection, force_close_policy_target,
         close_policy_overlay, save_app_limit, remove_app_limit, purchase_reward,
-        equip_reward, delete_local_data, export_local_data, hide_to_tray, quit_app
+        equip_reward, get_wellbeing_records, start_wellbeing_activity, advance_wellbeing_step, cancel_wellbeing_activity, complete_wellbeing_activity,
+        delete_local_data, export_local_data, hide_to_tray, quit_app
     ])
         .run(tauri::generate_context!())
         .expect("error while running Liba Bilancia");
 }
+

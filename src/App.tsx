@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type { Session, User } from '@supabase/supabase-js';
 import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import { check, type Update } from '@tauri-apps/plugin-updater';
 import {
@@ -14,9 +15,6 @@ import {
   fetchLeaderboard,
   setupDeepLinkAuth,
   signInWithGoogle,
-  signInWithAzure,
-  signInWithEmailPassword,
-  updatePassword,
   supabase,
   supabaseConfigured,
   supabaseConfigIssue,
@@ -28,7 +26,7 @@ import {
   equipReward,
   exportLocalData,
   getTrackerData,
-  getProtectionApps,
+  getRunningApps,
   hideToTray,
   quitApp,
   purchaseReward,
@@ -43,7 +41,7 @@ import type { AppLimit, AppMode, AppSettings, Category, LeaderboardRow, LimitAct
 
 const modes: AppMode[] = ['Casual', 'Smart', 'Deep Focus'];
 const categories: Category[] = ['Productive', 'Distracting', 'Communication', 'Media', 'Neutral'];
-type View = 'Overview' | 'Focus' | 'Insights' | 'Control' | 'Rewards' | 'Leaderboard' | 'Settings';
+type View = 'Overview' | 'Focus' | 'Insights' | 'Control' | 'Wellbeing' | 'Rewards' | 'Leaderboard' | 'Settings';
 
 const PROTECTED_EXES = new Set([
   'digital-balance.exe','liba-bilancia.exe','explorer.exe','system','system idle process',
@@ -188,6 +186,7 @@ const iconPaths: Record<string, string> = {
   control: 'M4 7h10M18 7h2M4 12h2M10 12h10M4 17h10M18 17h2M14 5v4M8 10v4M14 15v4',
   shop: 'M4 8h16l-1 12H5L4 8ZM8 8a4 4 0 0 1 8 0M8 12h.01M16 12h.01',
   settings: 'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8ZM4.9 4.9l2.1 2.1M17 17l2.1 2.1M4 12H1M23 12h-3M4.9 19.1 7 17M17 7l2.1-2.1M12 4V1M12 23v-3',
+  activity: 'M12 3v18M3 12h18M7 7l10 10M17 7 7 17',
   menu: 'M4 7h16M4 12h16M4 17h16',
   spark: 'M12 2l1.8 6.2L20 10l-6.2 1.8L12 18l-1.8-6.2L4 10l6.2-1.8L12 2z',
 };
@@ -227,6 +226,26 @@ const themeById = (id: string) => THEME_CATALOG.find((theme) => theme.id === id)
 function focusStreak(data: TrackerData) { const dates = new Set(data.focus_sessions.map((s) => new Date(s.completed_at).toDateString())); let count = 0; const cursor = new Date(); cursor.setHours(12,0,0,0); while (dates.has(cursor.toDateString())) { count += 1; cursor.setDate(cursor.getDate()-1); } return count; }
 function scoreFor(data: TrackerData) { const day = new Date().toDateString(); const sessions = data.sessions.filter((s) => new Date(s.started_at).toDateString() === day); const productive = sessions.filter((s) => s.category === 'Productive').reduce((a,s) => a+s.duration_secs,0); const distracting = sessions.filter((s) => s.category === 'Distracting').reduce((a,s) => a+s.duration_secs,0); const focus = data.focus_sessions.filter((s) => new Date(s.completed_at).toDateString() === day).reduce((a,s) => a+s.minutes,0); const limit = Math.max(1,data.settings.dailyDistractionLimitMinutes); const target = Math.max(1,data.settings.dailyFocusTargetMinutes); const balance = distracting/60 <= limit ? 100 : Math.max(25,100-((distracting/60-limit)*4)); const focusScore = Math.min(100,(focus/target)*100); const productiveRatio = productive+distracting>0 ? (productive/(productive+distracting))*100 : 70; return Math.round(balance*.45+focusScore*.35+productiveRatio*.2); }
 
+const COMMON_TARGETS = [
+  { name: 'Microsoft Edge', exe: 'msedge.exe', category: 'Neutral' as Category },
+  { name: 'Google Chrome', exe: 'chrome.exe', category: 'Neutral' as Category },
+  { name: 'Mozilla Firefox', exe: 'firefox.exe', category: 'Neutral' as Category },
+  { name: 'Discord', exe: 'discord.exe', category: 'Communication' as Category },
+  { name: 'Spotify', exe: 'spotify.exe', category: 'Media' as Category },
+  { name: 'Steam', exe: 'steam.exe', category: 'Media' as Category },
+  { name: 'Telegram', exe: 'telegram.exe', category: 'Communication' as Category },
+  { name: 'WhatsApp', exe: 'WhatsApp.exe', category: 'Communication' as Category },
+  { name: 'VLC media player', exe: 'vlc.exe', category: 'Media' as Category },
+  { name: 'Visual Studio Code', exe: 'Code.exe', category: 'Productive' as Category },
+  { name: 'Notion', exe: 'Notion.exe', category: 'Productive' as Category },
+  { name: 'Obsidian', exe: 'Obsidian.exe', category: 'Productive' as Category },
+  { name: 'Zoom', exe: 'Zoom.exe', category: 'Communication' as Category },
+  { name: 'Roblox', exe: 'RobloxPlayerBeta.exe', category: 'Media' as Category },
+  { name: 'Minecraft Launcher', exe: 'MinecraftLauncher.exe', category: 'Media' as Category },
+  { name: 'Epic Games Launcher', exe: 'EpicGamesLauncher.exe', category: 'Media' as Category },
+  { name: 'Battle.net', exe: 'Battle.net.exe', category: 'Media' as Category },
+  { name: 'GOG Galaxy', exe: 'GalaxyClient.exe', category: 'Media' as Category },
+];
 function isProtectedCandidate(exe: string) { return Boolean(exe) && !PROTECTED_EXES.has(exe.toLowerCase()); }
 function friendlyAppName(name: string, exe = '') {
   const key = (exe || name).toLowerCase().replace(/\.exe$/, '');
@@ -241,6 +260,72 @@ function friendlyAppName(name: string, exe = '') {
   const clean = (name || key).replace(/\.exe$/i, '').replace(/[_-]+/g, ' ').trim();
   return clean ? clean.charAt(0).toUpperCase() + clean.slice(1) : 'Unknown app';
 }
+
+
+type ActivityDefinition = {
+  id: string;
+  category: 'BREATHE' | 'FLOW' | 'ENERGISE' | 'UNPLUG' | 'RESET';
+  title: string;
+  summary: string;
+  minutes: number;
+  purpose: string;
+  steps: { title: string; detail: string }[];
+};
+
+const ACTIVITY_LIBRARY: ActivityDefinition[] = [
+  { id:'box-breathing', category:'BREATHE', title:'Box breathing', summary:'A quiet reset for busy moments.', minutes:3, purpose:'Slow the pace, notice your breathing, and lower mental tension.', steps:[
+    {title:'Settle',detail:'Sit comfortably. Drop your shoulders and let your hands rest.'},
+    {title:'Breathe in',detail:'Inhale gently through your nose while counting slowly.'},
+    {title:'Hold',detail:'Pause comfortably. Keep your face and jaw relaxed.'},
+    {title:'Breathe out',detail:'Exhale slowly, then repeat the cycle at an easy pace.'}
+  ]},
+  { id:'grounding-5', category:'BREATHE', title:'Five-senses grounding', summary:'A short mindfulness reset you can do anywhere.', minutes:4, purpose:'Bring attention back to the present moment when your mind feels crowded.', steps:[
+    {title:'See',detail:'Notice five things around you without judging them.'},
+    {title:'Feel',detail:'Notice four physical sensations, like your feet or the chair.'},
+    {title:'Hear',detail:'Notice three sounds, near or far.'},
+    {title:'Finish',detail:'Notice one slow breath and one thing you appreciate right now.'}
+  ]},
+  { id:'desk-stretch', category:'FLOW', title:'Neck & shoulder reset', summary:'Gentle mobility for study sessions and screen-heavy days.', minutes:6, purpose:'Release stiffness and build awareness of posture.', steps:[
+    {title:'Shoulder rolls',detail:'Roll both shoulders slowly backward, then forward.'},
+    {title:'Neck release',detail:'Tilt your head gently toward one shoulder, then switch sides.'},
+    {title:'Upper-back reach',detail:'Reach your arms forward and let the upper back broaden.'},
+    {title:'Reset posture',detail:'Sit or stand tall, relax your shoulders, and take three calm breaths.'}
+  ]},
+  { id:'morning-flow', category:'FLOW', title:'Gentle morning flow', summary:'A simple full-body mobility sequence.', minutes:8, purpose:'Wake up stiff areas and ease into movement.', steps:[
+    {title:'Reach',detail:'Reach both arms overhead, then lower them slowly.'},
+    {title:'Side flow',detail:'Lean gently to each side while keeping both feet grounded.'},
+    {title:'Fold',detail:'Hinge forward comfortably and let your arms relax.'},
+    {title:'Stand tall',detail:'Rise slowly, roll your shoulders back, and finish with three breaths.'}
+  ]},
+  { id:'march-break', category:'ENERGISE', title:'March & move', summary:'A low-impact movement break for between study blocks.', minutes:5, purpose:'Break up sedentary time and refresh alertness.', steps:[
+    {title:'March',detail:'March gently on the spot at a comfortable pace.'},
+    {title:'Arms',detail:'Add slow arm circles while continuing to move.'},
+    {title:'Squat',detail:'Add a few controlled, comfortable half-squats.'},
+    {title:'Balance',detail:'Slow down and practice a calm standing balance on each side.'}
+  ]},
+  { id:'balance-break', category:'ENERGISE', title:'Balance break', summary:'A small coordination challenge with no equipment.', minutes:4, purpose:'Wake up attention through controlled, simple movement.', steps:[
+    {title:'Find your base',detail:'Stand comfortably with feet about hip-width apart.'},
+    {title:'Shift',detail:'Shift your weight gently from one foot to the other.'},
+    {title:'Hold',detail:'Try a short single-leg balance on each side, using support if needed.'},
+    {title:'Reset',detail:'Return both feet to the floor and take a slow breath.'}
+  ]},
+  { id:'walk-reset', category:'UNPLUG', title:'Short outdoor walk', summary:'Step away from the screen and move at an easy pace.', minutes:10, purpose:'Create a real break from screens and reconnect with your surroundings.', steps:[
+    {title:'Step out',detail:'Leave the screen behind and begin an easy walk.'},
+    {title:'Notice',detail:'Notice three things you can see and two things you can hear.'},
+    {title:'Breathe',detail:'Let your pace stay comfortable and take a few slower breaths.'},
+    {title:'Return',detail:'Finish your walk deliberately instead of immediately reopening the screen.'}
+  ]},
+  { id:'desk-reset', category:'RESET', title:'Screen reset', summary:'A one-minute posture, eye, and hydration check.', minutes:3, purpose:'Create a practical pause before the next screen block.', steps:[
+    {title:'Look away',detail:'Look at something farther away for a comfortable moment.'},
+    {title:'Move',detail:'Stand up, roll your shoulders, and loosen your hands.'},
+    {title:'Hydrate',detail:'Take a few sips of water if you have some nearby.'},
+    {title:'Choose',detail:'Decide intentionally whether to return to the task or take a longer break.'}
+  ]},
+];
+
+type ActivityRecord = { id:string; completedAt:string; points:number };
+function dayKey(date=new Date()) { return date.toDateString(); }
+function activityDefinition(id:string) { return ACTIVITY_LIBRARY.find(item=>item.id===id) ?? ACTIVITY_LIBRARY[0]; }
 
 type AppearancePreference = 'system' | 'light' | 'dark';
 const APPEARANCE_STORAGE_KEY = 'liba-bilancia-appearance';
@@ -264,6 +349,9 @@ export default function App() {
   const [runningApps, setRunningApps] = useState<{ name: string; exe: string }[]>([]);
   const [runningAppsLoading, setRunningAppsLoading] = useState(false);
   const [runningAppsError, setRunningAppsError] = useState('');
+  const [protectionApps, setProtectionApps] = useState<{ name: string; exe: string; installed?: boolean }[]>([]);
+  const [protectionAppsLoading, setProtectionAppsLoading] = useState(false);
+  const [protectionAppsError, setProtectionAppsError] = useState('');
   const [leaderboard, setLeaderboard] = useState<LeaderboardRow[]>([]);
   const [notice, setNotice] = useState('');
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -283,6 +371,10 @@ export default function App() {
   const focusRestoreSizeRef = useRef<{ width: number; height: number } | null>(null);
   const focusRestoreFullscreenRef = useRef(false);
   const [focusFullscreen, setFocusFullscreen] = useState(false);
+  const [activityRecords, setActivityRecords] = useState<ActivityRecord[]>([]);
+  const [activitySession, setActivitySession] = useState<{id:string;startedAt:number;elapsed:number;step:number} | null>(null);
+  const activityTimerRef = useRef<number | null>(null);
+
   const [update, setUpdate] = useState<Update | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateDownloaded, setUpdateDownloaded] = useState(false);
@@ -299,6 +391,21 @@ export default function App() {
   const [profileDisplayName, setProfileDisplayName] = useState('');
 
   useEffect(() => { dataRef.current = data; }, [data]);
+  useEffect(() => {
+    let alive = true;
+    void invoke<ActivityRecord[]>('get_wellbeing_records').then(records => { if (alive) setActivityRecords(records); }).catch(error => { console.warn('Could not load wellbeing history:', error); });
+    return () => { alive = false; };
+  }, []);
+  useEffect(() => () => { if (activityTimerRef.current) window.clearInterval(activityTimerRef.current); }, []);
+  useEffect(() => {
+    if (!activitySession) return;
+    if (activityTimerRef.current) window.clearInterval(activityTimerRef.current);
+    activityTimerRef.current = window.setInterval(() => {
+      setActivitySession(current => current ? { ...current, elapsed: Math.max(0, Math.floor((Date.now() - current.startedAt) / 1000)) } : current);
+    }, 500);
+    return () => { if (activityTimerRef.current) window.clearInterval(activityTimerRef.current); };
+  }, [activitySession?.id, activitySession?.startedAt]);
+
 
   useEffect(() => {
     const media = window.matchMedia?.('(prefers-color-scheme: dark)');
@@ -352,21 +459,42 @@ export default function App() {
 
   useEffect(() => { if (data?.settings.deepFocusBlockedApps) setFocusApps(data.settings.deepFocusBlockedApps.filter(isProtectedCandidate)); }, [data?.settings.deepFocusBlockedApps]);
 
+  async function refreshProtectionApps() {
+    setProtectionAppsLoading(true);
+    setProtectionAppsError('');
+    try {
+      const apps = await invoke<{ name: string; exe: string; installed?: boolean }[]>('get_protection_apps');
+      setProtectionApps(apps.filter(app => isProtectedCandidate(app.exe)));
+    } catch (error) {
+      console.error('Could not load installed apps:', error);
+      setProtectionAppsError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setProtectionAppsLoading(false);
+    }
+  }
+
   async function refreshRunningApps() {
     setRunningAppsLoading(true);
     setRunningAppsError('');
     try {
-      const apps = await getProtectionApps();
+      const apps = await getRunningApps();
+      // The chooser shows only apps with visible windows right now. Keep the
+      // user's saved blocklist separately so a selected app stays protected
+      // if it is reopened after Focus begins.
       setRunningApps(apps);
     } catch (error) {
-      console.error('Could not load protection apps:', error);
+      console.error('Could not load currently running apps:', error);
       setRunningAppsError(error instanceof Error ? error.message : String(error));
     } finally { setRunningAppsLoading(false); }
   }
 
   useEffect(() => {
-    if (view !== 'Focus' && view !== 'Control') return;
+    if (view !== 'Focus') return;
     void refreshRunningApps();
+  }, [view]);
+  useEffect(() => {
+    if (view !== 'Control') return;
+    void refreshProtectionApps();
   }, [view]);
   useEffect(() => () => { if (previewTimerRef.current) window.clearTimeout(previewTimerRef.current); }, []);
 
@@ -638,6 +766,7 @@ export default function App() {
     return [...map.values()].sort((a,b)=>b.secs-a.secs).slice(0,16);
   }, [data]);
 
+  const appOptions = topApps.filter(app => isProtectedCandidate(app.exe));
   const weekly = useMemo(() => !data ? [] : Array.from({length:7},(_,index)=>{ const date=new Date(); date.setHours(12,0,0,0); date.setDate(date.getDate()-(6-index)); const key=date.toDateString(); const rows=data.sessions.filter(s=>new Date(s.started_at).toDateString()===key); const productive=rows.filter(s=>s.category==='Productive').reduce((a,s)=>a+s.duration_secs,0); const distracting=rows.filter(s=>s.category==='Distracting').reduce((a,s)=>a+s.duration_secs,0); return {label:date.toLocaleDateString(undefined,{weekday:'short'}),productive,distracting,total:productive+distracting}; }), [data]);
   const streak = data ? focusStreak(data) : 0;
   const score = data ? scoreFor(data) : 0;
@@ -773,6 +902,61 @@ export default function App() {
   async function pauseFocus() { setFocusRunning(false); await setFocusProtection(false,focusApps,data?.settings.mode ?? 'Smart').catch(()=>undefined); }
   async function changeMode(mode: AppMode) { if(!data)return; setData(await saveSettings({...data.settings,mode})); if(focusRunning){ await setFocusProtection(true,focusApps,mode).then(setData).catch(()=>undefined); } }
   async function togglePause() { if(!data)return; setData(await setTrackingPaused(!data.tracking_paused)); }
+  const activityTodayRecords = activityRecords.filter(item => dayKey(new Date(item.completedAt)) === dayKey());
+  const activityPointsToday = activityTodayRecords.reduce((sum,item)=>sum+item.points,0);
+  async function startActivity(id:string) {
+    const activity = activityDefinition(id);
+    const todayCount = activityTodayRecords.filter(item=>item.id===id).length;
+    if (activityTodayRecords.length >= 3) { setNotice('Daily wellbeing limit reached. Come back tomorrow for more activity rewards.'); return; }
+    if (todayCount >= 2) { setNotice('You can complete the same activity twice per day. Try a different reset next.'); return; }
+    try {
+      const startedAt = await invoke<number>('start_wellbeing_activity', { activityId: id });
+      setView('Wellbeing');
+      setActivitySession({id, startedAt, elapsed:0, step:0});
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    }
+  }
+  function stopActivity() {
+    if (activityTimerRef.current) window.clearInterval(activityTimerRef.current);
+    activityTimerRef.current = null;
+    setActivitySession(null);
+    void invoke('cancel_wellbeing_activity').catch(error => console.warn('Could not cancel wellbeing activity:', error));
+  }
+  async function completeActivity() {
+    if (!data || !activitySession) return;
+    const activity = activityDefinition(activitySession.id);
+    const required = activity.minutes * 60;
+    if (activitySession.elapsed < required || activitySession.step < activity.steps.length - 1) { setNotice('Stay with the guided activity until the timer is complete.'); return; }
+    try {
+      const result = await invoke<{ points:number; record:ActivityRecord }>('complete_wellbeing_activity', { activityId: activity.id });
+      const records = await invoke<ActivityRecord[]>('get_wellbeing_records');
+      const nextData = await getTrackerData();
+      setActivityRecords(records);
+      setData(nextData);
+      setNotice(result.points > 0
+        ? `${activity.title} complete — +${result.points} Balance Coins secured.`
+        : `${activity.title} complete. Today's wellbeing reward cap has been reached.`);
+      if (activityTimerRef.current) window.clearInterval(activityTimerRef.current);
+      activityTimerRef.current = null;
+      setActivitySession(null);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    }
+  }
+  async function advanceActivityStep() {
+    if (!activitySession) return;
+    const activity=activityDefinition(activitySession.id);
+    const nextStep=Math.min(activity.steps.length-1,activitySession.step+1);
+    const requiredPerStep=Math.ceil((activity.minutes*60)/activity.steps.length);
+    if (activitySession.elapsed < requiredPerStep*(activitySession.step+1)) { setNotice('Keep going a little longer before moving to the next step.'); return; }
+    try {
+      await invoke('advance_wellbeing_step', { activityId: activity.id, stepIndex: nextStep });
+      setActivitySession({...activitySession,step:nextStep});
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    }
+  }
   async function saveLimit(exe:string, limit:AppLimit) { if(!data)return; try{setData(await saveAppLimit(exe,limit));setNotice(`${friendlyAppName(exe,exe)} protection saved.`);}catch(error){console.error(error);setNotice(error instanceof Error?error.message:'Could not save that app protection.');} }
   async function removeLimit(exe:string){ if(!data)return; setData(await removeAppLimit(exe)); setNotice(`${friendlyAppName(exe,exe)} protection removed.`); }
   async function buyReward(reward:Reward){ if(!data)return; try{setData(await purchaseReward(reward.id));setNotice(`${reward.name} unlocked.`);}catch(error){setNotice(error instanceof Error?error.message:'You need more Balance Coins.');} }
@@ -798,14 +982,10 @@ export default function App() {
   function endThemePreview() { if (previewTimerRef.current) window.clearTimeout(previewTimerRef.current); previewTimerRef.current = null; setThemePreview(null); }
   async function applyTheme(themeId:string){ if(!data)return; endThemePreview(); setData(await saveSettings({...data.settings,theme:themeId})); setNotice(`${themeById(themeId).name} equipped.`); }
   async function saveDisplayName(name:string){ if(!data)return; const clean=name.trim().slice(0,28); if(!clean){setNotice('Choose a display name first.');return;} setData(await saveSettings({...data.settings,displayName:clean})); setProfileDisplayName(clean); if(user&&supabase){ try{await updateProfileDisplayName(clean);}catch(error){console.error(error);setNotice('Saved locally, but cloud profile update failed.');return;} } setNotice(`Identity set to ${clean}.`); }
-  async function saveAccountPassword(password:string){
-    try { await updatePassword(password); setNotice('Account password updated. You can use email + password after signing out.'); }
-    catch(error){ setNotice(error instanceof Error ? error.message : 'Could not update your password.'); }
-  }
 
   if(!authReady) return <Splash/>;
   if(!supabaseConfigured) return <CloudSetupScreen issue={supabaseConfigIssue ?? 'Cloud authentication is not configured.'}/>;
-  if(!session) return <LoginScreen onGoogleLogin={signInWithGoogle} onOutlookLogin={signInWithAzure} onEmailLogin={signInWithEmailPassword} notice={notice}/>;
+  if(!session) return <LoginScreen onLogin={signInWithGoogle} notice={notice}/>;
   if(needsUsername && user) return <UsernameSetup user={user} onComplete={async(username)=>{ await updateProfileUsername(username); setProfileDisplayName(username); if(data) setData({...data,settings:{...data.settings,displayName:username}}); setNeedsUsername(false); setNotice(`Welcome, ${username}.`); }} />;
   if(!profileReady || !data) return <Splash/>;
 
@@ -818,7 +998,7 @@ export default function App() {
   return <div className={rootClass} data-mode={data.settings.mode.replace(' ', '-')}>
     <aside className="sidebar">
       <div className="brand-row"><div className="brand"><BrandMark />{!sidebarCollapsed&&<div><strong>Liba Bilancia</strong><span>Own your screen time.</span></div>}</div><button className="sidebar-toggle" onClick={()=>setSidebarCollapsed(v=>!v)} title={sidebarCollapsed?'Show sidebar':'Hide sidebar'} aria-label={sidebarCollapsed?'Show sidebar':'Hide sidebar'}><Icon name="menu" size={17}/></button></div>
-            <nav className="nav-list">{([['Overview','grid'],['Focus','focus'],['Insights','insights'],['Control','control'],['Rewards','shop'],['Leaderboard','trophy'],['Settings','settings']] as [View,string][]).map(([id,icon])=><button key={id} className={`nav-item ${view===id?'active':''}`} onClick={()=>go(id)} title={id}><Icon name={icon}/>{!sidebarCollapsed&&<span>{id}</span>}</button>)}</nav>
+            <nav className="nav-list">{([['Overview','grid'],['Focus','focus'],['Insights','insights'],['Control','control'],['Wellbeing','activity'],['Rewards','shop'],['Leaderboard','trophy'],['Settings','settings']] as [View,string][]).map(([id,icon])=><button key={id} className={`nav-item ${view===id?'active':''}`} onClick={()=>go(id)} title={id}><Icon name={icon}/>{!sidebarCollapsed&&<span>{id}</span>}</button>)}</nav>
       <div className="sidebar-bottom"><div className="coin-mini"><span>{sidebarCollapsed?'Coins':'Balance Coins'}</span><strong>{data.settings.coins.toLocaleString()}</strong></div><button className="pause-btn" onClick={()=>void togglePause()}>{sidebarCollapsed?(data.tracking_paused?'▶':'Ⅱ'):(data.tracking_paused?'Resume tracking':'Pause tracking')}</button></div>
     </aside>
 
@@ -846,12 +1026,14 @@ export default function App() {
       </div>}
       {quote&&<div className="motivation-toast"><div><span className="section-label">Lock In</span><strong>{quote}</strong><small>Liba Bilancia noticed a distraction pattern.</small></div><div className="motivation-actions"><button className="ghost-btn small" onClick={()=>setQuote(null)}>Dismiss</button><button className="primary-btn small" onClick={()=>{setQuote(null);setView('Focus');void startFocus();}}>Start Focus</button></div></div>}
       {view==='Overview'&&<Overview data={data} score={score} today={today} topApps={topApps} streak={streak} onStartFocus={()=>{setView('Focus');void startFocus();}} onGo={setView} currentRemaining={currentRemaining} appName={appName}/>} 
-      {view==='Focus'&&<FocusPage data={data} minutes={focusMinutes} remaining={focusRemaining} running={focusRunning} completed={focusCompleted} focusApps={focusApps} setFocusApps={setFocusApps} knownApps={runningApps} runningAppsLoading={runningAppsLoading} runningAppsError={runningAppsError} onRefreshApps={refreshRunningApps} onDuration={v=>{setFocusMinutes(v);setFocusRemaining(v*60)}} onStart={startFocus} onPause={pauseFocus} onReset={()=>{setFocusRunning(false);setFocusRemaining(focusMinutes*60);void setFocusProtection(false,focusApps,data.settings.mode).then(()=>restoreFocusWindow()).catch(()=>restoreFocusWindow())}} onToggleFullscreen={toggleFocusFullscreen} fullscreen={focusFullscreen}/>}
+      {view==='Focus'&&<FocusPage data={data} minutes={focusMinutes} remaining={focusRemaining} running={focusRunning} completed={focusCompleted} focusApps={focusApps} setFocusApps={setFocusApps} knownApps={[...protectionApps, ...runningApps.filter(app => !protectionApps.some(installed => installed.exe.toLowerCase() === app.exe.toLowerCase()))]} runningAppsLoading={runningAppsLoading} runningAppsError={runningAppsError} onRefreshApps={refreshRunningApps} onDuration={v=>{setFocusMinutes(v);setFocusRemaining(v*60)}} onStart={startFocus} onPause={pauseFocus} onReset={()=>{setFocusRunning(false);setFocusRemaining(focusMinutes*60);void setFocusProtection(false,focusApps,data.settings.mode).then(()=>restoreFocusWindow()).catch(()=>restoreFocusWindow())}} onToggleFullscreen={toggleFocusFullscreen} fullscreen={focusFullscreen}/>}
       {view==='Insights'&&<Insights data={data} weekly={weekly} topApps={topApps}/>} 
-      {view==='Control'&&<ControlPage data={data} apps={runningApps} onSaveLimit={saveLimit} onRemoveLimit={removeLimit} focusApps={focusApps} setFocusApps={setFocusApps}/>} 
+      {view==='Control'&&<ControlPage data={data} topApps={appOptions} runningApps={runningApps} protectionApps={protectionApps} protectionAppsLoading={protectionAppsLoading} protectionAppsError={protectionAppsError} onRefreshProtectionApps={refreshProtectionApps} onSaveLimit={saveLimit} onRemoveLimit={removeLimit} focusApps={focusApps} setFocusApps={setFocusApps}/>}
+      {view==='Wellbeing'&&<WellbeingPage records={activityRecords} todayRecords={activityTodayRecords} todayPoints={activityPointsToday} session={activitySession} onStart={startActivity} onAdvance={advanceActivityStep} onComplete={completeActivity} onCancel={stopActivity}/>}
+ 
       {view==='Rewards'&&<RewardsPage data={data} rewards={rewards} filter={shopFilter} setFilter={setShopFilter} search={themeSearch} setSearch={setThemeSearch} preview={themePreview} onPreview={beginThemePreview} onBuy={buyReward} onEquip={equip} onApplyTheme={applyTheme} onResetPreview={endThemePreview}/>} 
       {view==='Leaderboard'&&<Leaderboard data={leaderboard} userId={user?.id ?? ''} refresh={refreshLeaderboard}/>} 
-      {view==='Settings'&&<SettingsPage data={data} setData={setData} user={user} appearance={appearance} onAppearanceChange={changeAppearance} onSaveDisplayName={saveDisplayName} onSavePassword={saveAccountPassword} onCheckForUpdates={checkForUpdates} updateCheckBusy={updateBusy}/>} 
+      {view==='Settings'&&<SettingsPage data={data} setData={setData} user={user} appearance={appearance} onAppearanceChange={changeAppearance} onSaveDisplayName={saveDisplayName} onCheckForUpdates={checkForUpdates} updateCheckBusy={updateBusy}/>} 
     </main>
 
     {paletteOpen&&<CommandPalette onClose={()=>setPaletteOpen(false)} onGo={go} onStartFocus={()=>{setPaletteOpen(false);setView('Focus');void startFocus();}}/>}
@@ -891,40 +1073,9 @@ function UsernameSetup({user,onComplete}:{user:User;onComplete:(username:string)
 
   return <div className="login-screen username-screen"><div className="login-card username-card"><BrandMark big/><div className="eyebrow">One-time setup</div><h1>Choose your username.</h1><p>This is the name Liba Bilancia will use for your profile and leaderboard identity.</p><label className="field"><span>Username</span><input autoFocus maxLength={20} value={value} onChange={e=>setValue(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g,''))} onKeyDown={e=>{if(e.key==='Enter')void submit()}} placeholder="your_username"/></label><div className={`username-status ${status}`}><span className="status-dot"/>{message}</div><button className="primary-btn wide" disabled={!canContinue} onClick={()=>void submit()}>{busy?'Saving…':'Continue'}</button><div className="privacy-note">Signed in as {user.email ?? 'your Google account'}.</div></div></div>;}
 
-function LoginScreen({onGoogleLogin,onOutlookLogin,onEmailLogin,notice}:{onGoogleLogin:()=>Promise<void>;onOutlookLogin:()=>Promise<void>;onEmailLogin:(email:string,password:string)=>Promise<void>;notice:string}){
-  const [mode,setMode]=useState<'providers'|'email'>('providers');
-  const [email,setEmail]=useState('');
-  const [password,setPassword]=useState('');
-  const [busy,setBusy]=useState(false);
-  const [localError,setLocalError]=useState('');
-  const submitEmail=async()=>{
-    setLocalError('');
-    if(!email.trim() || !password){ setLocalError('Enter your email and password.'); return; }
-    setBusy(true);
-    try { await onEmailLogin(email,password); } catch(error){ setLocalError(error instanceof Error ? error.message : 'Email sign-in failed.'); } finally { setBusy(false); }
-  };
-  const runProvider=async(fn:()=>Promise<void>)=>{ setLocalError(''); setBusy(true); try { await fn(); } catch(error){ setLocalError(error instanceof Error ? error.message : 'Sign-in failed.'); } finally { setBusy(false); } };
-  return <div className="login-screen"><div className="login-card auth-card">
-    <BrandMark big />
-    <div className="eyebrow">Liba Bilancia</div>
-    <h1>{mode==='email'?'Welcome back.':'Choose how you sign in.'}</h1>
-    <p>{mode==='email'?'Use the email and password connected to your Liba Bilancia account.':'Use Google, Outlook / Microsoft, or your Liba Bilancia email and password.'}</p>
-    {mode==='providers'?<div className="auth-provider-grid">
-      <button className="google-btn" disabled={busy} onClick={()=>void runProvider(onGoogleLogin)}><span className="provider-glyph google-glyph">G</span> Continue with Google</button>
-      <button className="outlook-btn" disabled={busy} onClick={()=>void runProvider(onOutlookLogin)}><span className="provider-glyph outlook-glyph">⊞</span> Continue with Outlook</button>
-      <div className="auth-divider"><span>OR</span></div>
-      <button className="email-login-btn" disabled={busy} onClick={()=>setMode('email')}><span>✉</span> Continue with email</button>
-    </div>:<div className="email-login-panel">
-      <label className="field"><span>Email address</span><input autoFocus type="email" value={email} onChange={e=>setEmail(e.target.value)} onKeyDown={e=>{if(e.key==='Enter')void submitEmail()}} placeholder="you@example.com" autoComplete="email"/></label>
-      <label className="field"><span>Password</span><input type="password" value={password} onChange={e=>setPassword(e.target.value)} onKeyDown={e=>{if(e.key==='Enter')void submitEmail()}} placeholder="Your password" autoComplete="current-password"/></label>
-      <button className="primary-btn wide" disabled={busy} onClick={()=>void submitEmail()}>{busy?'Signing in…':'Sign in'}</button>
-      <button className="ghost-btn wide" disabled={busy} onClick={()=>setMode('providers')}>Back to sign-in options</button>
-    </div>}
-    <div className="privacy-note">Detailed activity remains local. Only the minimum leaderboard data is synchronized.</div>
-    {(localError||notice)&&<div className="login-error">{localError||notice}</div>}
-  </div></div>;
-}
-function Overview({data,score,today,topApps,streak,onStartFocus,onGo,currentRemaining,appName}:{data:TrackerData;score:number;today:{tracked:number;productive:number;distracting:number;focus:number};topApps:{name:string;exe:string;category:Category;secs:number}[];streak:number;onStartFocus:()=>void;onGo:(view:View)=>void;currentRemaining:number|null;appName:string}){const progress=Math.min(100,(today.focus/Math.max(1,data.settings.dailyFocusTargetMinutes))*100);return <div className="content-grid"><section className="hero-grid"><div className="hero-card hero-main"><span className="section-label">Liba Bilancia Score</span><div className="hero-title-row"><div><h2>{score>=80?'Locked in.':score>=60?'Good momentum.':'Time to reset.'}</h2><p>Your score combines focus, productive time and distraction control — not just raw screen time.</p><div className="hero-actions"><button className="primary-btn" onClick={onStartFocus}>Start Focus</button><button className="ghost-btn" onClick={()=>onGo('Control')}>Tune limits</button></div></div><div className="score-ring" style={{'--score':`${score}%`} as CSSProperties}><span>{score}</span></div></div></div><div className="stat-card"><span>Tracked today</span><strong>{time(today.tracked)}</strong><small>{minutes(today.productive)}m productive · {minutes(today.distracting)}m distracting</small></div><div className="stat-card"><span>Focus streak</span><strong>{streak}d</strong><small>{streak>0?'Keep the run alive.':'Complete a Focus session today.'}</small></div></section><section className="live-grid"><div className="panel live-panel"><div className="panel-head"><div><span className="section-label">Active Now</span><h3>{appName}</h3></div><span className={`live-chip ${data.tracking_paused?'off':''}`}>{data.tracking_paused?'Paused':'Live'}</span></div><div className="live-meta"><span>{data.current_category ?? 'Neutral'}</span><span>{time(data.current_session_secs)} current session</span>{currentRemaining!==null&&<span>{currentRemaining}m left on protection</span>}</div><div className="signal">{[1,2,3,4,5].map(i=><i key={i}/>)}</div></div><div className="panel focus-goal"><span className="section-label">TODAY'S FOCUS</span><strong>{today.focus} / {data.settings.dailyFocusTargetMinutes}m</strong><p>Complete the target to strengthen your Balance score and earn Coins.</p><div className="progress"><span style={{width:`${progress}%`}}/></div></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Usage</span><h3>Most-used apps</h3></div><button className="text-btn" onClick={()=>onGo('Insights')}>Open insights →</button></div><div className="app-list">{topApps.length?topApps.slice(0,8).map(app=><div className="app-row" key={app.exe}><div className="app-name"><span className={`category-dot ${app.category.toLowerCase()}`}/><div className="app-name-copy"><strong title={app.exe}>{app.name}</strong><span>{app.category}</span></div></div><div className="app-bar"><span style={{width:`${Math.max(3,(app.secs/topApps[0].secs)*100)}%`}}/></div><strong className="app-time">{time(app.secs)}</strong></div>):<div className="empty">Use the computer for a bit and your real app history will appear here.</div>}</div></section><section className="momentum-strip"><div><span className="section-label">Momentum</span><strong>{today.distracting<=data.settings.dailyDistractionLimitMinutes*60?'Within distraction limit':'Over your distraction target'}</strong><small>Liba Bilancia updates this in the background while you work.</small></div><button className="ghost-btn" onClick={()=>onGo('Rewards')}>Open Reward Lab</button></section></div>;}
+function LoginScreen({onLogin,notice}:{onLogin:()=>Promise<void>;notice:string}){return <div className="login-screen"><div className="login-card"><BrandMark big /><div className="eyebrow">Liba Bilancia</div><h1>A smarter relationship with your screen.</h1><p>Track Windows usage, set real limits, earn rewards, run Focus, and compare progress without sending detailed activity to the cloud.</p><button className="google-btn" onClick={()=>void onLogin()}><span>G</span> Continue with Google</button><div className="privacy-note">Detailed activity remains local. Only the minimum leaderboard data is synchronized.</div>{notice&&<div className="login-error">{notice}</div>}</div></div>;}
+
+function Overview({data,score,today,topApps,streak,onStartFocus,onGo,currentRemaining,appName}:{data:TrackerData;score:number;today:{tracked:number;productive:number;distracting:number;focus:number};topApps:{name:string;exe:string;category:Category;secs:number}[];streak:number;onStartFocus:()=>void;onGo:(view:View)=>void;currentRemaining:number|null;appName:string}){const progress=Math.min(100,(today.focus/Math.max(1,data.settings.dailyFocusTargetMinutes))*100);const hour=new Date().getHours();const greeting=hour<12?'Good morning':hour<18?'Good afternoon':'Good evening';return <div className="content-grid home-v2"><section className="home-greeting"><div><span className="section-label">{new Date().toLocaleDateString(undefined,{weekday:'long',month:'long',day:'numeric'})}</span><h2>{greeting}, {data.settings.displayName||'there'}.</h2><p>Choose what deserves your attention next.</p></div><button className="ghost-btn" onClick={()=>onGo('Wellbeing')}>Take a wellbeing break</button></section><section className="home-glow-bars" aria-hidden="true">{[1,2,3,4,5,6,7].map(i=><i key={i}/>)}</section><section className="hero-grid"><div className="hero-card hero-main"><span className="section-label">Liba Bilancia Score</span><div className="hero-title-row"><div><h2>{score>=80?'Locked in.':score>=60?'Good momentum.':'Time to reset.'}</h2><p>Your score combines focus, productive time and distraction control — not just raw screen time.</p><div className="hero-actions"><button className="primary-btn" onClick={onStartFocus}>Start Focus</button><button className="ghost-btn" onClick={()=>onGo('Control')}>Tune limits</button></div></div><div className="score-ring" style={{'--score':`${score}%`} as CSSProperties}><span>{score}</span></div></div></div><div className="stat-card"><span>Tracked today</span><strong>{time(today.tracked)}</strong><small>{minutes(today.productive)}m productive · {minutes(today.distracting)}m distracting</small></div><div className="stat-card"><span>Focus streak</span><strong>{streak}d</strong><small>{streak>0?'Keep the run alive.':'Complete a Focus session today.'}</small></div></section><section className="live-grid"><div className="panel live-panel"><div className="panel-head"><div><span className="section-label">Active Now</span><h3>{appName}</h3></div><span className={`live-chip ${data.tracking_paused?'off':''}`}>{data.tracking_paused?'Paused':'Live'}</span></div><div className="live-meta"><span>{data.current_category ?? 'Neutral'}</span><span>{time(data.current_session_secs)} current session</span>{currentRemaining!==null&&<span>{currentRemaining}m left on protection</span>}</div><div className="signal">{[1,2,3,4,5].map(i=><i key={i}/>)}</div></div><div className="panel focus-goal"><span className="section-label">TODAY'S FOCUS</span><strong>{today.focus} / {data.settings.dailyFocusTargetMinutes}m</strong><p>Complete the target to strengthen your Balance score and earn Coins.</p><div className="progress"><span style={{width:`${progress}%`}}/></div></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Usage</span><h3>Most-used apps</h3></div><button className="text-btn" onClick={()=>onGo('Insights')}>Open insights →</button></div><div className="app-list">{topApps.length?topApps.slice(0,8).map(app=><div className="app-row" key={app.exe}><div className="app-name"><span className={`category-dot ${app.category.toLowerCase()}`}/><div className="app-name-copy"><strong title={app.exe}>{app.name}</strong><span>{app.category}</span></div></div><div className="app-bar"><span style={{width:`${Math.max(3,(app.secs/topApps[0].secs)*100)}%`}}/></div><strong className="app-time">{time(app.secs)}</strong></div>):<div className="empty">Use the computer for a bit and your real app history will appear here.</div>}</div></section><section className="momentum-strip"><div><span className="section-label">Momentum</span><strong>{today.distracting<=data.settings.dailyDistractionLimitMinutes*60?'Within distraction limit':'Over your distraction target'}</strong><small>Liba Bilancia updates this in the background while you work.</small></div><button className="ghost-btn" onClick={()=>onGo('Rewards')}>Open Reward Lab</button></section></div>;}
 
 function FocusPage({
   data,
@@ -1161,7 +1312,7 @@ function FocusPage({
           </div>
 
           <div className="focus-clean-app-meta">
-            {knownApps.length} user app{knownApps.length === 1 ? '' : 's'} available
+            {knownApps.length} open app{knownApps.length === 1 ? '' : 's'} found
           </div>
 
           {runningAppsError ? (
@@ -1196,7 +1347,7 @@ function FocusPage({
             </div>
           ) : (
             <div className="empty focus-clean-empty">
-              No user apps found. Refresh the list or install the app you want to protect.
+              No open apps found. Open the apps you want to protect, then refresh this list.
             </div>
           )}
         </section>
@@ -1207,48 +1358,90 @@ function FocusPage({
 
 function Insights({data,weekly,topApps}:{data:TrackerData;weekly:{label:string;productive:number;distracting:number;total:number}[];topApps:{name:string;exe:string;category:Category;secs:number}[]}){const max=Math.max(1,...weekly.map(x=>x.total));const consistency=Array.from({length:14},(_,index)=>{const date=new Date();date.setHours(12,0,0,0);date.setDate(date.getDate()-(13-index));const key=date.toDateString();const minutes=data.focus_sessions.filter(s=>new Date(s.completed_at).toDateString()===key).reduce((a,s)=>a+s.minutes,0);return {key,label:date.toLocaleDateString(undefined,{weekday:'short'}),day:date.getDate(),minutes};});const recentFocus=[...data.focus_sessions].sort((a,b)=>new Date(b.completed_at).getTime()-new Date(a.completed_at).getTime()).slice(0,8);return <div className="insights-grid"><section className="panel"><div className="panel-head"><div><span className="section-label">Last 7 Days</span><h3>Usage rhythm</h3></div><span className="mini-pill">Live</span></div><div className="week-chart">{weekly.map(day=><div className="week-day" key={day.label}><div className="stack"><i className="productive" style={{height:`${(day.productive/max)*190}px`}}/><i className="distracting" style={{height:`${(day.distracting/max)*190}px`}}/></div><small>{day.label}</small></div>)}</div></section><section className="panel"><span className="section-label">Session Patterns</span><div className="metric-list"><div><span>Longest session</span><strong>{time(Math.max(0,...data.sessions.map(s=>s.duration_secs)))}</strong></div><div><span>Most-used app</span><strong>{topApps[0]?.name??'No data yet'}</strong></div><div><span>Focus completions</span><strong>{data.focus_sessions.length}</strong></div><div><span>Coins earned</span><strong>{data.focus_sessions.reduce((a,s)=>a+s.coins,0)}</strong></div></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Focus Consistency</span><h3>Last 14 days</h3></div><span className="mini-pill">{consistency.filter(d=>d.minutes>0).length} active days</span></div><div className="consistency-grid">{consistency.map(day=><div className={`consistency-day ${day.minutes>0?'active':''}`} key={day.key} title={`${day.label} ${day.day}: ${day.minutes} min`}><span style={{opacity:Math.min(1,0.25+day.minutes/60)}}>{day.day}</span></div>)}</div><div className="consistency-legend"><span><i className="consistency-dot"/> Focus completed</span><span>{consistency.reduce((a,d)=>a+d.minutes,0)} min total</span></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Recent Focus</span><h3>Latest completed sessions</h3></div><span className="mini-pill">{recentFocus.length} shown</span></div><div className="focus-history-list">{recentFocus.length?recentFocus.map((item,index)=><div className="focus-history-row" key={`${item.completed_at}-${index}`}><div><strong>{item.minutes} min · {item.mode}</strong><small>{new Date(item.completed_at).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</small></div><div><span>{item.coins} coins</span><b>{item.points} focus pts</b></div></div>):<div className="empty">Complete a Focus session and your history will appear here.</div>}</div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Top Apps</span><h3>Where your time goes</h3></div></div><div className="rank-list">{topApps.slice(0,10).map((app,i)=><div key={app.exe}><span className="rank-num">#{String(i+1).padStart(2,'0')}</span><div className="rank-app-copy"><strong>{app.name}</strong><small>{app.category}</small></div><b>{time(app.secs)}</b></div>)}</div></section></div>;}
 
-function ControlPage({data,apps,onSaveLimit,onRemoveLimit,focusApps,setFocusApps}:{data:TrackerData;apps:{name:string;exe:string}[];onSaveLimit:(exe:string,limit:AppLimit)=>Promise<void>;onRemoveLimit:(exe:string)=>Promise<void>;focusApps:string[];setFocusApps:(v:string[])=>void}){
-  const [selected,setSelected]=useState(''); const [limit,setLimit]=useState(30); const [action,setAction]=useState<LimitAction>('Block'); const [scope,setScope]=useState<LimitScope>('Daily'); const [expiresAt,setExpiresAt]=useState(''); const [search,setSearch]=useState(''); const [focusSearch,setFocusSearch]=useState('');
-  const configured=Object.entries(data.settings.appLimits); const selectedRule=selected?data.settings.appLimits[selected]:undefined;
-  useEffect(()=>{if(!selected&&apps.length)setSelected(apps[0].exe);},[apps,selected]);
-  useEffect(()=>{const rule=selected?data.settings.appLimits[selected]:undefined;setLimit(rule?.dailyMinutes??30);setAction(rule?.action??'Block');setScope(rule?.scope??'Daily');setExpiresAt(rule?.expiresAt?.slice(0,16)??'');},[selected,data.settings.appLimits]);
-  const filteredApps=apps.filter(app=>{const q=search.trim().toLowerCase();return !q||app.name.toLowerCase().includes(q)||app.exe.toLowerCase().includes(q);}).slice(0,80);
-  const filteredFocusApps=apps.filter(app=>{const q=focusSearch.trim().toLowerCase();return !q||app.name.toLowerCase().includes(q)||app.exe.toLowerCase().includes(q);}).slice(0,80);
-  const handleSave=()=>{if(!selected)return;if(scope==='UntilDate'&&!expiresAt)return;void onSaveLimit(selected,{dailyMinutes:Math.max(1,Math.floor(limit)),action,enabled:true,scope,startedAt:new Date().toISOString(),expiresAt:scope==='UntilDate'?new Date(expiresAt).toISOString():undefined});};
-  const toggleFocus=(exe:string)=>setFocusApps(focusApps.includes(exe)?focusApps.filter(x=>x!==exe):[...focusApps,exe]);
-  return <div className="control-grid"><section className="panel"><div className="panel-head"><div><span className="section-label">App limits</span><h3>Choose any app</h3></div><span className="mini-pill">{configured.length} rules</span></div><p className="muted-copy">Pick an installed user app even when it is closed. Windows system processes are filtered out.</p><div className="app-protection-picker"><label className="field"><span>Find an app</span><input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search Chrome, Spotify, Discord…"/></label><div className="protection-app-grid">{filteredApps.map(app=><button type="button" key={app.exe} className={`protection-app-option ${selected===app.exe?'selected':''}`} onClick={()=>setSelected(app.exe)}><span>{app.name}</span><small>{app.exe}</small></button>)}</div>{!filteredApps.length&&<div className="empty">No matching user apps found.</div>}</div>{selected&&<div className="limit-builder"><div className="selected-protection-app"><span>Selected app</span><strong>{apps.find(app=>app.exe===selected)?.name??friendlyAppName(selected,selected)}</strong><small>{selected}</small></div><label><span>{scope==='Daily'?'Minutes / day':'Total minutes'}</span><input type="number" min="1" step="1" value={limit} onChange={e=>setLimit(Number(e.target.value))}/></label><label><span>Scope</span><SmartSelect value={scope} onChange={v=>setScope(v as LimitScope)} options={[{value:'Daily',label:'Daily'},{value:'UntilDate',label:'Until date'}]}/></label><label><span>Action</span><SmartSelect value={action} onChange={v=>setAction(v as LimitAction)} options={[{value:'Warn',label:'Warn · 3 openings'},{value:'Close',label:'Close every opening'},{value:'Block',label:'Block until reset'}]}/></label>{scope==='UntilDate'&&<label className="limit-date"><span>Deadline</span><input type="datetime-local" value={expiresAt} onChange={e=>setExpiresAt(e.target.value)}/></label>}<div className="quick-times"><button onClick={()=>setLimit(15)}>15m</button><button onClick={()=>setLimit(30)}>30m</button><button onClick={()=>setLimit(60)}>1h</button><button onClick={()=>setLimit(120)}>2h</button></div><button className="primary-btn" disabled={!selected||(scope==='UntilDate'&&!expiresAt)} onClick={handleSave}>{selectedRule?'Update protection':'Save protection'}</button></div>}<div className="rule-list">{configured.length?configured.map(([exe,rule])=><div className="rule-row" key={exe}><div><strong>{friendlyAppName(exe,exe)}</strong><small>{rule.dailyMinutes.toLocaleString()} min · {rule.scope==='UntilDate'?'until '+new Date(rule.expiresAt??'').toLocaleString():'per day'} · {rule.action==='Warn'?'3 warnings, then block':rule.action}</small></div><button className="text-btn danger-text" onClick={()=>void onRemoveLimit(exe)}>Remove</button></div>):<div className="empty">No protection rules yet.</div>}</div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Deep Focus blocklist</span><h3>Apps to protect during Focus</h3></div><span className="mini-pill">{focusApps.length} selected</span></div><p className="muted-copy">Select apps whether they are open now or not. Deep Focus will enforce the blocklist against every matching process.</p><label className="field"><span>Find an app</span><input value={focusSearch} onChange={e=>setFocusSearch(e.target.value)} placeholder="Search installed apps…"/></label><div className="protection-app-grid">{filteredFocusApps.map(app=><button type="button" key={app.exe} className={`protection-app-option ${focusApps.includes(app.exe)?'selected':''}`} onClick={()=>toggleFocus(app.exe)}><span>{app.name}</span>{focusApps.includes(app.exe)&&<b>✓</b>}<small>{app.exe}</small></button>)}</div>{!filteredFocusApps.length&&<div className="empty">No matching user apps found.</div>}</section></div>;
-}
-function RewardsPage({data,rewards:catalog,filter,setFilter,search,setSearch,preview,onPreview,onBuy,onEquip,onApplyTheme,onResetPreview}:{data:TrackerData;rewards:Reward[];filter:'theme'|'frame'|'effect';setFilter:(v:'theme'|'frame'|'effect')=>void;search:string;setSearch:(v:string)=>void;preview:string|null;onPreview:(id:string)=>void;onBuy:(r:Reward)=>Promise<void>;onEquip:(r:Reward)=>Promise<void>;onApplyTheme:(id:string)=>Promise<void>;onResetPreview:()=>void}){
-  const owned=new Set(data.settings.ownedRewards); const filtered=catalog.filter(r=>r.kind===filter && (!search.trim()||r.name.toLowerCase().includes(search.toLowerCase()))); const tabs=[['theme','Interface themes'],['frame','Profile cosmetics'],['effect','Focus effects']] as const;
-  const previewInfo = (() => { try { const raw=localStorage.getItem('liba-bilancia-theme-previews'); if(!raw) return {used:0,today:false}; const parsed=JSON.parse(raw) as {week?:string;dates?:string[]}; const day=new Date(); const weekday=day.getDay(); const mondayOffset=weekday===0?-6:1-weekday; day.setDate(day.getDate()+mondayOffset); const week=day.toISOString().slice(0,10); const dates=parsed.week===week?(parsed.dates??[]):[]; return {used:dates.length,today:dates.includes(new Date().toDateString())}; } catch { return {used:0,today:false}; } })();
-  return <div className="rewards-page">
-    <section className="shop-hero"><div><span className="section-label">Reward Lab</span><h2>Make your workspace yours.</h2><p>Eight free themes start you off. Spend Balance Coins on 100 themes, profile frames, and Focus effects. Paid themes get a 15-second preview twice per week, never twice on the same day.</p></div><div className="coin-card"><span>Balance Coins</span><strong>{data.settings.coins.toLocaleString()}</strong><small>{owned.size} rewards owned</small></div></section>
-    <section className="reward-earning-grid"><div className="earning-card"><strong>Earn leaderboard points</strong><span>Focus minutes, daily check-in, daily Focus goal, 3 Focus sessions in a day, and weekly consistency all add rank points.</span></div><div className="earning-card"><strong>Spend Balance Coins</strong><span>Unlock themes, profile frames, and Focus ambience effects. Spending Coins never lowers your leaderboard rank.</span></div></section>
-    <div className="reward-toolbar"><div className="reward-tabs">{tabs.map(([id,label])=><button key={id} className={filter===id?'active':''} onClick={()=>setFilter(id)}>{label} <small>{catalog.filter(r=>r.kind===id).length}</small></button>)}</div><input className="shop-search" value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search the collection…"/>{preview&&<button className="ghost-btn small" onClick={onResetPreview}>End preview</button>}</div>
-    <div className="theme-live-preview">{preview?<><span className="preview-dot"/><strong>Previewing {themeById(preview).name}</strong><span>15 seconds · preview allowance is used.</span></>:<><Icon name="spark" size={14}/><span>Paid themes: {previewInfo.used}/2 weekly previews{previewInfo.today?' · already used today':''}</span></>}</div>
-    <div className="reward-grid">{filtered.map(reward=>{const isOwned=owned.has(reward.id)||reward.price===0;const isEquipped=reward.kind==='theme'?data.settings.theme===reward.id:reward.kind==='frame'?data.settings.equippedFrame===reward.id:data.settings.equippedEffect===reward.id;const insufficient=data.settings.coins<reward.price;const canPreview=reward.kind==='theme'&&reward.price>0&&!isOwned;const previewBlocked=previewInfo.used>=2||previewInfo.today;return <div key={reward.id} className={`reward-card ${isEquipped?'equipped':''}`} style={{'--reward-accent':reward.accent} as CSSProperties}><div className="reward-art"><span>{reward.kind==='theme'?'◈':reward.kind==='frame'?'◇':'✦'}</span></div><div className="reward-copy"><div className="reward-top"><strong>{reward.name}</strong>{isEquipped&&<em>Equipped</em>}</div><p>{reward.description}</p><div className="reward-bottom"><span>{reward.price===0?'Free':`${reward.price.toLocaleString()} coins`}</span><div className="reward-actions">{canPreview&&<button className="ghost-btn small" disabled={previewBlocked} onClick={()=>onPreview(reward.id)}>{previewBlocked?'Preview unavailable':'Preview 15s'}</button>}{isOwned?<button className="primary-btn small" onClick={()=>void (reward.kind==='theme'?onApplyTheme(reward.id):onEquip(reward))}>{isEquipped?'Active':'Equip'}</button>:<button className="primary-btn small" disabled={insufficient} onClick={()=>void onBuy(reward)}>{insufficient?`Need ${(reward.price-data.settings.coins).toLocaleString()}`:'Unlock'}</button>}</div></div></div></div>})}</div>
+function AppPicker({apps,value,onChange,onClose,onRefresh,loading,error}:{apps:{name:string;exe:string;category?:Category;secs?:number;running?:boolean;recent?:boolean;installed?:boolean}[];value:string;onChange:(exe:string)=>void;onClose:()=>void;onRefresh:()=>Promise<void>;loading:boolean;error:string}){
+  const [query,setQuery]=useState('');
+  const [tab,setTab]=useState<'all'|'installed'|'running'|'recent'>('all');
+  const q=query.trim().toLowerCase();
+  const filtered=apps.filter(app=>isProtectedCandidate(app.exe)).filter(app=>!q || app.name.toLowerCase().includes(q) || app.exe.toLowerCase().includes(q)).filter(app=>{ if(tab==='installed') return app.installed; if(tab==='running') return app.running; if(tab==='recent') return Boolean(app.recent); return true; });
+  const manualTarget = q.toLowerCase().endsWith('.exe') ? q : `${q}.exe`;
+  const canUseManual = /^[a-z0-9][a-z0-9._-]{0,155}\.exe$/i.test(manualTarget) && isProtectedCandidate(manualTarget);
+  const grouped=filtered.slice(0,60);
+  return <div className="app-picker-backdrop" role="dialog" aria-modal="true" aria-labelledby="app-picker-title" onClick={onClose}>
+    <div className="app-picker" onClick={e=>e.stopPropagation()}>
+      <div className="app-picker-head"><div><span className="section-label">APP LIBRARY</span><h3 id="app-picker-title">Choose an app</h3><p>Search installed desktop apps, recent apps, or currently running apps.</p><small className="app-picker-count">{apps.length} available targets {loading ? '· refreshing…' : ''}</small></div><div className="app-picker-head-actions"><button className="ghost-btn small" onClick={()=>void onRefresh()} disabled={loading}>{loading?'Refreshing…':'Refresh library'}</button><button className="icon-close" onClick={onClose} aria-label="Close app picker">×</button></div></div>
+      <div className="app-picker-search"><span>⌕</span><input autoFocus value={query} onChange={e=>setQuery(e.target.value)} onKeyDown={e=>{if(e.key==='Escape'){e.preventDefault();onClose();}}} placeholder="Search apps…"/><kbd>ESC</kbd></div>
+      <div className="app-picker-tabs">{([['all','All apps'],['installed','Installed'],['running','Running now'],['recent','Recently used']] as const).map(([id,label])=><button key={id} className={tab===id?'active':''} onClick={()=>setTab(id)}>{label}</button>)}</div>
+      <div className="app-picker-grid">{grouped.map(app=><button key={app.exe} className={`app-picker-item ${value.toLowerCase()===app.exe.toLowerCase()?'selected':''}`} onClick={()=>{onChange(app.exe);onClose();}}><span className="app-picker-icon">{friendlyAppName(app.name,app.exe).slice(0,1).toUpperCase()}</span><span><strong>{app.name}</strong><small>{app.running?'Running now':app.installed?'Installed on this PC':app.recent?'Recently used':'Available target'}</small></span>{value.toLowerCase()===app.exe.toLowerCase()&&<b>✓</b>}</button>)}
+      {!grouped.length&&<div className="app-picker-empty"><strong>{loading?'Loading app library…':'No matching app'}</strong><span>{error || 'Search by app name or executable. Installed apps can be selected even while closed.'}</span>{canUseManual&&<button className="ghost-btn small" onClick={()=>{onChange(manualTarget);onClose();}}>Use {manualTarget} as target</button>}</div>}</div>
+    </div>
   </div>;
 }
 
-function Leaderboard({data,userId,refresh}:{data:LeaderboardRow[];userId:string;refresh:()=>Promise<void>}){return <div className="leaderboard-layout"><section className="panel leader-main"><div className="panel-head"><div><span className="section-label">Global</span><h3>People building better habits</h3></div><button className="ghost-btn small" onClick={()=>void refresh()}>Refresh</button></div>{data.length?data.slice(0,25).map((row,index)=><div className={`leader-row ${row.user_id===userId?'me':''}`} key={row.user_id}><span className="rank-badge">{String(index+1).padStart(2,'0')}</span><div className="leader-avatar">{row.display_name.slice(0,1).toUpperCase()}</div><div><strong>{row.display_name}</strong><small>{row.user_id===userId?'You':'Liba Bilancia member'}</small></div><b>{row.total_points.toLocaleString()}</b></div>):<div className="empty">No leaderboard rows yet.</div>}</section><section className="panel leaderboard-side"><span className="section-label">Your Ranking</span><div className="big-score">{data.find(r=>r.user_id===userId)?.total_points??0}</div><p>Leaderboard points and Balance Coins are intentionally separate, so shopping never lowers your rank. Earn rank points from Focus minutes (+1/min, capped at 120 per session), daily check-ins, hitting your Focus goal, completing 3 Focus sessions in a day, and weekly consistency.</p></section></div>;}
+function ControlPage({data,topApps,runningApps,protectionApps,protectionAppsLoading,protectionAppsError,onRefreshProtectionApps,onSaveLimit,onRemoveLimit,focusApps,setFocusApps}:{data:TrackerData;topApps:{name:string;exe:string;category:Category;secs:number}[];runningApps:{name:string;exe:string}[];protectionApps:{name:string;exe:string;installed?:boolean}[];protectionAppsLoading:boolean;protectionAppsError:string;onRefreshProtectionApps:()=>Promise<void>;onSaveLimit:(exe:string,limit:AppLimit)=>Promise<void>;onRemoveLimit:(exe:string)=>Promise<void>;focusApps:string[];setFocusApps:(v:string[])=>void}){
+  const [selected,setSelected]=useState(topApps[0]?.exe ?? COMMON_TARGETS[0].exe);
+  const [pickerOpen,setPickerOpen]=useState(false);
+  const [limit,setLimit]=useState(data.settings.appLimits[selected]?.dailyMinutes??30);
+  const [action,setAction]=useState<LimitAction>(data.settings.appLimits[selected]?.action??'Block');
+  const [scope,setScope]=useState<LimitScope>(data.settings.appLimits[selected]?.scope??'Daily');
+  const [expiresAt,setExpiresAt]=useState(data.settings.appLimits[selected]?.expiresAt?.slice(0,16)??'');
+  useEffect(()=>{const rule=selected?data.settings.appLimits[selected]:undefined;setLimit(rule?.dailyMinutes??30);setAction(rule?.action??'Block');setScope(rule?.scope??'Daily');setExpiresAt(rule?.expiresAt?.slice(0,16)??'');},[selected]);
+  const configured=Object.entries(data.settings.appLimits);
+  const appCatalog=useMemo(()=>{
+    const map=new Map<string,{name:string;exe:string;category?:Category;secs?:number;running?:boolean;recent?:boolean;installed?:boolean}>();
+    for(const app of COMMON_TARGETS) map.set(app.exe.toLowerCase(),{...app});
+    for(const app of protectionApps) map.set(app.exe.toLowerCase(),{...app,installed:Boolean(app.installed)});
+    for(const app of topApps) { const key=app.exe.toLowerCase(); map.set(key,{...map.get(key),...app,recent:true}); }
+    for(const app of runningApps) { const key=app.exe.toLowerCase(); const installed=Boolean(map.get(key)?.installed); map.set(key,{...map.get(key),...app,installed,running:true}); }
+    for(const session of data.sessions) if(isProtectedCandidate(session.exe) && !map.has(session.exe.toLowerCase())) map.set(session.exe.toLowerCase(),{name:friendlyAppName(session.exe,session.exe),exe:session.exe,recent:true});
+    return [...map.values()].filter(app=>isProtectedCandidate(app.exe)).sort((a,b)=>a.name.localeCompare(b.name));
+  },[data.sessions,topApps,runningApps,protectionApps]);
+  const selectedName=friendlyAppName(selected,selected);
+  const handleSave=()=>{if(!selected)return;if(scope==='UntilDate'&&!expiresAt)return;void onSaveLimit(selected,{dailyMinutes:Math.max(1,Math.floor(limit)),action,enabled:true,scope,startedAt:new Date().toISOString(),expiresAt:scope==='UntilDate'?new Date(expiresAt).toISOString():undefined});};
+  return <div className="control-v2">
+    <section className="control-hero panel"><div><span className="section-label">CONTROL CENTER</span><h2>Protect the apps that pull you away.</h2><p>Rules stay local to this device. Choose an app, set the limit, then decide exactly how Liba Bilancia responds.</p></div><div className="control-summary"><strong>{configured.length}</strong><span>active rules</span></div></section>
+    <section className="control-builder panel"><div className="builder-head"><div><span className="section-label">APP PROTECTION</span><h3>Choose your app</h3></div><span className="mini-pill">Normal apps only</span></div>
+      <button className="app-picker-trigger" type="button" onClick={()=>setPickerOpen(true)} aria-haspopup="dialog" aria-expanded={pickerOpen}><span className="app-picker-trigger-icon">{selectedName.slice(0,1).toUpperCase()}</span><span><strong>{selectedName}</strong><small>{selected}</small></span><span className="app-picker-trigger-arrow">⌄</span></button>
+      <div className="control-fields"><label><span>{scope==='Daily'?'Minutes / day':'Total minutes'}</span><input type="number" min="1" step="1" value={limit} onChange={e=>setLimit(Number(e.target.value))}/></label><label><span>Scope</span><SmartSelect value={scope} onChange={v=>setScope(v as LimitScope)} options={[{value:'Daily',label:'Daily'},{value:'UntilDate',label:'Until date'}]}/></label><label><span>Action</span><SmartSelect value={action} onChange={v=>setAction(v as LimitAction)} options={[{value:'Warn',label:'Warn — 3 chances'},{value:'Close',label:'Close'},{value:'Block',label:'Block'}]}/></label>{scope==='UntilDate'&&<label><span>Deadline</span><input type="datetime-local" value={expiresAt} onChange={e=>setExpiresAt(e.target.value)}/></label>}</div>
+      <div className="quick-times"><button onClick={()=>setLimit(15)}>15m</button><button onClick={()=>setLimit(30)}>30m</button><button onClick={()=>setLimit(60)}>1h</button><button onClick={()=>setLimit(120)}>2h</button></div><button className="primary-btn" disabled={!selected || (scope==='UntilDate'&&!expiresAt)} onClick={handleSave}>Save protection</button>
+      <div className="control-note"><strong>Warn mode</strong><span>Opening the app triggers 1/3 → 2/3 → 3/3. The fourth opening is blocked.</span></div>
+    </section>
+    <section className="panel protection-rules"><div className="panel-head"><div><span className="section-label">ACTIVE RULES</span><h3>What Liba Bilancia is enforcing</h3></div><span className="mini-pill">{configured.length} rules</span></div>{configured.length?configured.map(([exe,rule])=><div className="protection-row" key={exe}><div className="protection-app"><span className="protection-icon">{friendlyAppName(exe,exe).slice(0,1)}</span><div><strong>{friendlyAppName(exe,exe)}</strong><small>{rule.dailyMinutes.toLocaleString()} min · {rule.scope==='UntilDate'?'until '+new Date(rule.expiresAt??'').toLocaleString():'per day'}</small></div></div><div className="protection-status"><span className={`action-dot ${String(rule.action).toLowerCase()}`}/>{rule.action}<button className="text-btn danger-text" onClick={()=>void onRemoveLimit(exe)}>Remove</button></div></div>):<div className="empty">No protection rules yet. Liba Bilancia itself is never offered as a target.</div>}</section>
+    <section className="panel focus-blocklist"><div className="panel-head"><div><span className="section-label">DEEP FOCUS</span><h3>Apps to close during Focus</h3></div><span className="mini-pill">{focusApps.length} selected</span></div><p className="muted-copy">Select the same app targets here for Focus Protection. The picker stays searchable and excludes Windows system processes.</p><div className="chip-grid">{appCatalog.slice(0,18).map(app=><button key={app.exe} className={`app-chip ${focusApps.includes(app.exe)?'selected':''}`} onClick={()=>setFocusApps(focusApps.includes(app.exe)?focusApps.filter(x=>x!==app.exe):[...focusApps,app.exe])}>{app.name}</button>)}</div></section>
+    {pickerOpen&&<AppPicker apps={appCatalog} value={selected} onChange={setSelected} onClose={()=>setPickerOpen(false)} onRefresh={onRefreshProtectionApps} loading={protectionAppsLoading} error={protectionAppsError}/>}
+  </div>;
+}
 
-function SettingsPage({data,setData,user,appearance,onAppearanceChange,onSaveDisplayName,onSavePassword,onCheckForUpdates,updateCheckBusy}:{data:TrackerData;setData:(data:TrackerData)=>void;user:User|null;appearance:AppearancePreference;onAppearanceChange:(value:AppearancePreference)=>void;onSaveDisplayName:(name:string)=>Promise<void>;onSavePassword:(password:string)=>Promise<void>;onCheckForUpdates:()=>Promise<void>;updateCheckBusy:boolean}){
+function WellbeingPage({records,todayRecords,todayPoints,session,onStart,onAdvance,onComplete,onCancel}:{records:ActivityRecord[];todayRecords:ActivityRecord[];todayPoints:number;session:{id:string;startedAt:number;elapsed:number;step:number}|null;onStart:(id:string)=>void;onAdvance:()=>void;onComplete:()=>void;onCancel:()=>void}){
+  if(session){
+    const activity=activityDefinition(session.id); const total=activity.minutes*60; const progress=Math.min(100,(session.elapsed/total)*100); const current=activity.steps[session.step]; const minPerStep=Math.ceil(total/activity.steps.length); const stepReady=session.elapsed>=minPerStep*(session.step+1); const finished=session.elapsed>=total&&session.step>=activity.steps.length-1;
+    return <div className="wellbeing-page wellbeing-session"><section className="panel wellbeing-session-card"><div className="wellbeing-session-top"><div><span className="section-label">{activity.category}</span><h2>{activity.title}</h2><p>{activity.purpose}</p></div><button className="ghost-btn small" onClick={onCancel}>Exit</button></div><div className="wellbeing-timer"><strong>{String(Math.floor((total-session.elapsed)/60)).padStart(2,'0')}:{String((total-session.elapsed)%60).padStart(2,'0')}</strong><span>{Math.round(progress)}% complete</span></div><div className="wellbeing-progress"><span style={{width:`${progress}%`}}/></div><div className="activity-step"><div className="step-number">{String(session.step+1).padStart(2,'0')}</div><div><span>GUIDED STEP</span><h3>{current.title}</h3><p>{current.detail}</p></div></div><div className="activity-step-list">{activity.steps.map((step,i)=><div key={step.title} className={`activity-step-dot ${i<session.step?'done':''} ${i===session.step?'current':''}`}><span>{i<session.step?'✓':String(i+1)}</span><strong>{step.title}</strong></div>)}</div><div className="wellbeing-session-actions"><button className="ghost-btn" disabled={!stepReady || session.step>=activity.steps.length-1} onClick={onAdvance}>{session.step>=activity.steps.length-1?'Final step':'Next step'}</button><button className="primary-btn" disabled={!finished} onClick={onComplete}>{finished?'Complete & earn points':'Keep going'}</button></div><small className="wellbeing-fairness">Rewards unlock only after the guided timer is complete. You can earn up to 3 activity rewards per day.</small></section></div>;
+  }
+  const groups=(['BREATHE','FLOW','ENERGISE','UNPLUG','RESET'] as const).map(category=>({category,items:ACTIVITY_LIBRARY.filter(a=>a.category===category)}));
+  return <div className="wellbeing-page"><section className="wellbeing-hero panel"><div><span className="section-label">WELLBEING</span><h2>Take a real break, not another tab.</h2><p>Short guided activities for calm, movement, recovery, and healthier screen routines. Every activity tells you exactly what to do.</p></div><div className="wellbeing-score"><strong>{todayPoints}</strong><span>points today</span><small>{todayRecords.length}/3 rewarded sessions</small></div></section><div className="wellbeing-daily panel"><div><span className="section-label">TODAY</span><h3>Your wellbeing rhythm</h3></div><div className="wellbeing-metrics"><div><strong>{todayRecords.length}</strong><span>completed</span></div><div><strong>{todayPoints}</strong><span>points</span></div><div><strong>{records.length}</strong><span>all-time sessions</span></div></div></div>{groups.map(group=><section className="wellbeing-group" key={group.category}><div className="wellbeing-group-head"><div><span className="section-label">{group.category}</span><h3>{group.category==='BREATHE'?'Mindfulness & breathing':group.category==='FLOW'?'Yoga & stretching':group.category==='ENERGISE'?'Light movement':group.category==='UNPLUG'?'Outdoor & social':'Small practical resets'}</h3></div><span className="mini-pill">{group.items.length} activities</span></div><div className="activity-grid">{group.items.map(activity=><article className="activity-card panel" key={activity.id}><div className="activity-card-top"><span className="activity-duration">{activity.minutes} min</span><span className="activity-mark">{activity.category.slice(0,1)}</span></div><h4>{activity.title}</h4><p>{activity.summary}</p><div className="activity-preview-steps">{activity.steps.slice(0,2).map(step=><span key={step.title}>{step.title}</span>)}</div><button className="primary-btn small" onClick={()=>onStart(activity.id)}>Start guided activity</button></article>)}</div></section>)}</div>;
+}
+
+function RewardsPage({data,rewards:catalog,filter,setFilter,search,setSearch,preview,onPreview,onBuy,onEquip,onApplyTheme,onResetPreview}:{data:TrackerData;rewards:Reward[];filter:'theme'|'frame'|'effect';setFilter:(v:'theme'|'frame'|'effect')=>void;search:string;setSearch:(v:string)=>void;preview:string|null;onPreview:(id:string)=>void;onBuy:(r:Reward)=>Promise<void>;onEquip:(r:Reward)=>Promise<void>;onApplyTheme:(id:string)=>Promise<void>;onResetPreview:()=>void}){
+  const owned=new Set(data.settings.ownedRewards); const filtered=catalog.filter(r=>r.kind===filter && (!search.trim()||r.name.toLowerCase().includes(search.toLowerCase()))); const tabs=[['theme','Themes'],['frame','Frames'],['effect','Focus effects']] as const;
+  const featured=filtered.find(r=>r.price===0) ?? filtered[0];
+  const previewInfo=(()=>{try{const raw=localStorage.getItem('liba-bilancia-theme-previews');const parsed=raw?JSON.parse(raw) as {week?:string;dates?:string[]}:{};const day=new Date();const weekday=day.getDay();const mondayOffset=weekday===0?-6:1-weekday;day.setDate(day.getDate()+mondayOffset);const week=day.toISOString().slice(0,10);const dates=parsed.week===week?(parsed.dates??[]):[];return {used:dates.length,today:dates.includes(new Date().toDateString())};}catch{return {used:0,today:false};}})();
+  return <div className="rewards-page rewards-v2">
+    <section className="reward-hero panel"><div><span className="section-label">REWARD LAB</span><h2>Build a workspace that feels like yours.</h2><p>Earn Balance Coins from Focus and wellbeing, then turn them into themes, profile frames, and Focus effects. Your visual theme follows you through Home, Focus, and the rest of the app.</p><div className="reward-hero-actions"><button className="primary-btn" onClick={()=>setFilter('theme')}>Browse themes</button><button className="ghost-btn" onClick={()=>setSearch('')}>Clear search</button></div></div><div className="reward-wallet"><span>Balance Coins</span><strong>{data.settings.coins.toLocaleString()}</strong><small>{owned.size} rewards owned</small></div></section>
+    <section className="reward-collection panel"><div className="reward-toolbar-v2"><div className="reward-tabs">{tabs.map(([id,label])=><button key={id} className={filter===id?'active':''} onClick={()=>setFilter(id)}>{label}<small>{catalog.filter(r=>r.kind===id).length}</small></button>)}</div><div className="reward-search"><span>⌕</span><input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search your collection…"/>{search&&<button onClick={()=>setSearch('')} aria-label="Clear search">×</button>}</div></div><div className="reward-status-row"><span><Icon name="spark" size={14}/> Paid theme previews: {previewInfo.used}/2 this week{previewInfo.today?' · used today':''}</span>{preview&&<button className="ghost-btn small" onClick={onResetPreview}>End preview</button>}</div>
+    {featured&&<div className="reward-feature" style={{'--reward-accent':featured.accent} as CSSProperties}><div className="reward-feature-art"><div className="reward-glow"/><span>{featured.kind==='theme'?'Theme':featured.kind==='frame'?'Frame':'Effect'}</span></div><div className="reward-feature-copy"><span className="section-label">FEATURED</span><h3>{featured.name}</h3><p>{featured.description}</p><div className="reward-feature-meta"><strong>{featured.price===0?'Free':`${featured.price.toLocaleString()} coins`}</strong>{owned.has(featured.id)||featured.price===0?<button className="primary-btn small" onClick={()=>void (featured.kind==='theme'?onApplyTheme(featured.id):onEquip(featured))}>{featured.kind==='theme'&&data.settings.theme===featured.id?'Active':'Equip'}</button>:<button className="primary-btn small" disabled={data.settings.coins<featured.price} onClick={()=>void onBuy(featured)}>{data.settings.coins<featured.price?'Not enough coins':'Unlock'}</button>}</div></div></div>}
+    <div className="reward-grid-v2">{filtered.map(reward=>{const isOwned=owned.has(reward.id)||reward.price===0;const isEquipped=reward.kind==='theme'?data.settings.theme===reward.id:reward.kind==='frame'?data.settings.equippedFrame===reward.id:data.settings.equippedEffect===reward.id;const insufficient=data.settings.coins<reward.price;const canPreview=reward.kind==='theme'&&reward.price>0&&!isOwned;const previewBlocked=previewInfo.used>=2||previewInfo.today;return <article key={reward.id} className={`reward-card-v2 ${isEquipped?'equipped':''}`} style={{'--reward-accent':reward.accent} as CSSProperties}><div className="reward-card-art"><span>{reward.kind==='theme'?'A':reward.kind==='frame'?'F':'E'}</span></div><div className="reward-card-copy"><div className="reward-card-title"><strong>{reward.name}</strong>{isEquipped&&<em>Active</em>}</div><p>{reward.description}</p><div className="reward-card-bottom"><span>{reward.price===0?'Free':`${reward.price.toLocaleString()} coins`}</span><div>{canPreview&&<button className="text-btn" disabled={previewBlocked} onClick={()=>onPreview(reward.id)}>{previewBlocked?'Preview used':'Preview'}</button>}{isOwned?<button className="primary-btn small" onClick={()=>void (reward.kind==='theme'?onApplyTheme(reward.id):onEquip(reward))}>{isEquipped?'Active':'Equip'}</button>:<button className="primary-btn small" disabled={insufficient} onClick={()=>void onBuy(reward)}>{insufficient?`Need ${(reward.price-data.settings.coins).toLocaleString()}`:'Unlock'}</button>}</div></div></div></article>})}</div></section>
+  </div>;
+}
+
+function Leaderboard({data,userId,refresh}:{data:LeaderboardRow[];userId:string;refresh:()=>Promise<void>}){const meIndex=data.findIndex(row=>row.user_id===userId);const me=meIndex>=0?data[meIndex]:undefined;const topThree=data.slice(0,3);const visibleRows=data.slice(0,25);if(me&&meIndex>=25)visibleRows.push(me);return <div className="leaderboard-v2"><section className="leaderboard-hero panel"><div><span className="section-label">LEADERBOARD</span><h2>Progress is better with people around you.</h2><p>Keep your focus, consistency, and healthy routines moving forward. Spending Balance Coins never lowers your rank.</p></div><div className="leaderboard-me"><span>Your rank</span><strong>{me?`#${data.findIndex(row=>row.user_id===userId)+1}`:'—'}</strong><small>{me?`${me.total_points.toLocaleString()} points`:'No rank yet'}</small></div></section><section className="leaderboard-podium panel"><div className="podium-grid">{topThree.map((row,index)=><div className={`podium-card place-${index+1}`} key={row.user_id}><span className="podium-place">{index+1}</span><div className="leader-avatar large">{row.display_name.slice(0,1).toUpperCase()}</div><strong>{row.display_name}</strong><small>{row.total_points.toLocaleString()} pts</small></div>)}</div></section><section className="panel leader-main-v2"><div className="panel-head"><div><span className="section-label">GLOBAL</span><h3>People building better habits</h3></div><button className="ghost-btn small" onClick={()=>void refresh()}>Refresh</button></div>{data.length?visibleRows.map((row,index)=><div className={`leader-row-v2 ${row.user_id===userId?'me':''}`} key={row.user_id}><span className="rank-badge">{String(data.findIndex(item=>item.user_id===row.user_id)+1).padStart(2,'0')}</span><div className="leader-avatar">{row.display_name.slice(0,1).toUpperCase()}</div><div className="leader-copy"><strong>{row.display_name}</strong><small>{row.user_id===userId?'You':'Liba Bilancia member'}</small></div><b>{row.total_points.toLocaleString()}</b></div>):<div className="empty">No leaderboard rows yet.</div>}</section></div>;}
+
+function SettingsPage({data,setData,user,appearance,onAppearanceChange,onSaveDisplayName,onCheckForUpdates,updateCheckBusy}:{data:TrackerData;setData:(data:TrackerData)=>void;user:User|null;appearance:AppearancePreference;onAppearanceChange:(value:AppearancePreference)=>void;onSaveDisplayName:(name:string)=>Promise<void>;onCheckForUpdates:()=>Promise<void>;updateCheckBusy:boolean}){
   const [busy,setBusy]=useState(false); const [name,setName]=useState(data.settings.displayName||user?.user_metadata?.name||user?.email?.split('@')[0]||'Liba Bilancia');
   useEffect(()=>{setName(data.settings.displayName||user?.user_metadata?.name||user?.email?.split('@')[0]||'Liba Bilancia');},[data.settings.displayName]);
   async function update(patch:Partial<AppSettings>){setBusy(true);try{setData(await saveSettings({...data.settings,...patch}));}finally{setBusy(false);}}
   const knownApps=[...new Set(data.sessions.map(s=>s.exe))].filter(isProtectedCandidate).sort().slice(0,40);
-  return <div className="settings-grid"><section className="panel appearance-panel"><div className="panel-head"><div><span className="section-label">Appearance</span><h3>Choose your workspace look</h3></div></div><p className="muted-copy">Pick a light or dark workspace, or let Liba Bilancia follow your Windows appearance.</p><div className="appearance-options" role="group" aria-label="App appearance">{([['light','Light'],['dark','Dark'],['system','System']] as [AppearancePreference,string][]).map(([value,label])=><button type="button" key={value} className={appearance===value?'selected':''} aria-pressed={appearance===value} onClick={()=>onAppearanceChange(value)}><span className={`appearance-swatch ${value}`}/><strong>{label}</strong><small>{value==='system'?'Follow Windows':value==='light'?'Bright surfaces':'Low-light surfaces'}</small></button>)}</div><p className="appearance-note">Reward themes still change accent colours and typography. Your appearance choice always controls the background and panels, so rewards will not force dark mode.</p></section><section className="panel"><div className="panel-head"><div><span className="section-label">Identity</span><h3>Make the profile yours</h3></div></div><label className="field"><span>Display name</span><input maxLength={28} value={name} onChange={e=>setName(e.target.value)}/></label><div className="name-actions"><button className="primary-btn" onClick={()=>void onSaveDisplayName(name)}>Save name</button><button className="ghost-btn" onClick={()=>{const n=randomName();setName(n);void onSaveDisplayName(n)}}>Random name</button></div><div className="preset-names">{AESTHETIC_NAMES.slice(0,8).map(n=><button key={n} onClick={()=>{setName(n);void onSaveDisplayName(n)}}>{n}</button>)}</div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Behavior</span><h3>Daily rules</h3></div>{busy&&<span className="mini-pill">Saving…</span>}</div><label className="field"><span>Distraction limit (minutes)</span><input type="number" min="1" value={data.settings.dailyDistractionLimitMinutes} onChange={e=>void update({dailyDistractionLimitMinutes:Math.max(1,Math.floor(Number(e.target.value)||1))})}/></label><label className="field"><span>Focus target (minutes)</span><input type="number" min="1" value={data.settings.dailyFocusTargetMinutes} onChange={e=>void update({dailyFocusTargetMinutes:Math.max(1,Math.floor(Number(e.target.value)||1))})}/></label><label className="field"><span>Idle threshold (seconds)</span><input type="number" min="15" value={data.settings.idleThresholdSeconds} onChange={e=>void update({idleThresholdSeconds:Math.max(15,Math.floor(Number(e.target.value)||15))})}/></label><div className="setting-toggle"><div><strong>Notifications</strong><small>Allow Liba Bilancia nudges.</small></div><button className={`toggle ${data.settings.notificationsEnabled?'on':''}`} onClick={()=>void update({notificationsEnabled:!data.settings.notificationsEnabled})}><span/></button></div><div className="setting-toggle"><div><strong>Motivational nudges</strong><small>Occasional firm reminders when distraction runs long.</small></div><button className={`toggle ${data.settings.motivationalNudges?'on':''}`} onClick={()=>void update({motivationalNudges:!data.settings.motivationalNudges})}><span/></button></div></section><AccountSecurity onSavePassword={onSavePassword}/><section className="panel"><div className="panel-head"><div><span className="section-label">Windows</span><h3>Integration</h3></div></div><div className="setting-toggle"><div><strong>Start with Windows</strong><small>Launch the tracker when you sign in.</small></div><button className={`toggle ${data.settings.autostartEnabled?'on':''}`} onClick={()=>void update({autostartEnabled:!data.settings.autostartEnabled})}><span/></button></div><div className="setting-toggle"><div><strong>Ask before closing</strong><small>Offer to keep Liba Bilancia running quietly in the tray.</small></div><button className={`toggle ${data.settings.closeToTray?'on':''}`} onClick={()=>void update({closeToTray:!data.settings.closeToTray})}><span/></button></div><div className="setting-toggle"><div><strong>Deep Focus auto-block</strong><small>Enforce your Focus blocklist when Deep Focus starts.</small></div><button className={`toggle ${data.settings.deepFocusAutoBlock?'on':''}`} onClick={()=>void update({deepFocusAutoBlock:!data.settings.deepFocusAutoBlock})}><span/></button></div><div className="setting-toggle"><div><strong>Updates</strong><small>Check GitHub for a newer Liba Bilancia release.</small></div><button className="ghost-btn" onClick={()=>void onCheckForUpdates()} disabled={updateCheckBusy}>{updateCheckBusy?'Checking…':'Check for updates'}</button></div><button className="danger-btn" onClick={async()=>{if(window.confirm('Delete all local Liba Bilancia activity?'))setData(await deleteLocalData())}}>Delete local activity</button><button className="ghost-btn full" onClick={async()=>{await navigator.clipboard.writeText(await exportLocalData())}}>Copy privacy export JSON</button></section><section className="panel full-width"><div className="panel-head"><div><span className="section-label">Categories</span><h3>Teach Liba Bilancia your apps</h3></div><small>Liba Bilancia and Windows system processes are excluded.</small></div>{knownApps.length?knownApps.map(exe=>{const current=data.settings.categoryOverrides[exe]??data.sessions.find(s=>s.exe===exe)?.category??'Neutral';return <div className="category-row" key={exe}><span>{friendlyAppName(exe,exe)}</span><SmartSelect value={current} onChange={v=>void saveCategory(exe,v).then(setData)} options={categories.map(c=>({value:c,label:c}))} ariaLabel={`Category for ${friendlyAppName(exe,exe)}`}/></div>}):<div className="empty">Use the computer for a bit and app categories will appear here.</div>}</section></div>;}
+  return <div className="settings-grid"><section className="panel appearance-panel"><div className="panel-head"><div><span className="section-label">Appearance</span><h3>Choose your workspace look</h3></div></div><p className="muted-copy">Pick a light or dark workspace, or let Liba Bilancia follow your Windows appearance.</p><div className="appearance-options" role="group" aria-label="App appearance">{([['light','Light'],['dark','Dark'],['system','System']] as [AppearancePreference,string][]).map(([value,label])=><button type="button" key={value} className={appearance===value?'selected':''} aria-pressed={appearance===value} onClick={()=>onAppearanceChange(value)}><span className={`appearance-swatch ${value}`}/><strong>{label}</strong><small>{value==='system'?'Follow Windows':value==='light'?'Bright surfaces':'Low-light surfaces'}</small></button>)}</div><p className="appearance-note">Reward themes still change accent colours and typography. Your appearance choice always controls the background and panels, so rewards will not force dark mode.</p></section><section className="panel"><div className="panel-head"><div><span className="section-label">Identity</span><h3>Make the profile yours</h3></div></div><label className="field"><span>Display name</span><input maxLength={28} value={name} onChange={e=>setName(e.target.value)}/></label><div className="name-actions"><button className="primary-btn" onClick={()=>void onSaveDisplayName(name)}>Save name</button><button className="ghost-btn" onClick={()=>{const n=randomName();setName(n);void onSaveDisplayName(n)}}>Random name</button></div><div className="preset-names">{AESTHETIC_NAMES.slice(0,8).map(n=><button key={n} onClick={()=>{setName(n);void onSaveDisplayName(n)}}>{n}</button>)}</div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Behavior</span><h3>Daily rules</h3></div>{busy&&<span className="mini-pill">Saving…</span>}</div><label className="field"><span>Distraction limit (minutes)</span><input type="number" min="1" value={data.settings.dailyDistractionLimitMinutes} onChange={e=>void update({dailyDistractionLimitMinutes:Math.max(1,Math.floor(Number(e.target.value)||1))})}/></label><label className="field"><span>Focus target (minutes)</span><input type="number" min="1" value={data.settings.dailyFocusTargetMinutes} onChange={e=>void update({dailyFocusTargetMinutes:Math.max(1,Math.floor(Number(e.target.value)||1))})}/></label><label className="field"><span>Idle threshold (seconds)</span><input type="number" min="15" value={data.settings.idleThresholdSeconds} onChange={e=>void update({idleThresholdSeconds:Math.max(15,Math.floor(Number(e.target.value)||15))})}/></label><div className="setting-toggle"><div><strong>Notifications</strong><small>Allow Liba Bilancia nudges.</small></div><button className={`toggle ${data.settings.notificationsEnabled?'on':''}`} onClick={()=>void update({notificationsEnabled:!data.settings.notificationsEnabled})}><span/></button></div><div className="setting-toggle"><div><strong>Motivational nudges</strong><small>Occasional firm reminders when distraction runs long.</small></div><button className={`toggle ${data.settings.motivationalNudges?'on':''}`} onClick={()=>void update({motivationalNudges:!data.settings.motivationalNudges})}><span/></button></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Windows</span><h3>Integration</h3></div></div><div className="setting-toggle"><div><strong>Start with Windows</strong><small>Launch the tracker when you sign in.</small></div><button className={`toggle ${data.settings.autostartEnabled?'on':''}`} onClick={()=>void update({autostartEnabled:!data.settings.autostartEnabled})}><span/></button></div><div className="setting-toggle"><div><strong>Ask before closing</strong><small>Offer to keep Liba Bilancia running quietly in the tray.</small></div><button className={`toggle ${data.settings.closeToTray?'on':''}`} onClick={()=>void update({closeToTray:!data.settings.closeToTray})}><span/></button></div><div className="setting-toggle"><div><strong>Deep Focus auto-block</strong><small>Enforce your Focus blocklist when Deep Focus starts.</small></div><button className={`toggle ${data.settings.deepFocusAutoBlock?'on':''}`} onClick={()=>void update({deepFocusAutoBlock:!data.settings.deepFocusAutoBlock})}><span/></button></div><div className="setting-toggle"><div><strong>Updates</strong><small>Check GitHub for a newer Liba Bilancia release.</small></div><button className="ghost-btn" onClick={()=>void onCheckForUpdates()} disabled={updateCheckBusy}>{updateCheckBusy?'Checking…':'Check for updates'}</button></div><button className="danger-btn" onClick={async()=>{if(window.confirm('Delete all local Liba Bilancia activity?'))setData(await deleteLocalData())}}>Delete local activity</button><button className="ghost-btn full" onClick={async()=>{await navigator.clipboard.writeText(await exportLocalData())}}>Copy privacy export JSON</button></section><section className="panel full-width"><div className="panel-head"><div><span className="section-label">Categories</span><h3>Teach Liba Bilancia your apps</h3></div><small>Liba Bilancia and Windows system processes are excluded.</small></div>{knownApps.length?knownApps.map(exe=>{const current=data.settings.categoryOverrides[exe]??data.sessions.find(s=>s.exe===exe)?.category??'Neutral';return <div className="category-row" key={exe}><span>{friendlyAppName(exe,exe)}</span><SmartSelect value={current} onChange={v=>void saveCategory(exe,v).then(setData)} options={categories.map(c=>({value:c,label:c}))} ariaLabel={`Category for ${friendlyAppName(exe,exe)}`}/></div>}):<div className="empty">Use the computer for a bit and app categories will appear here.</div>}</section></div>;}
 
-function AccountSecurity({onSavePassword}:{onSavePassword:(password:string)=>Promise<void>}){
-  const [password,setPassword]=useState('');
-  const [confirm,setConfirm]=useState('');
-  const [busy,setBusy]=useState(false);
-  const mismatch=confirm.length>0&&password!==confirm;
-  const save=async()=>{if(password.length<8||mismatch)return;setBusy(true);try{await onSavePassword(password);setPassword('');setConfirm('');}finally{setBusy(false);}};
-  return <section className="panel security-panel"><div className="panel-head"><div><span className="section-label">Account security</span><h3>Set an email password</h3></div></div><p className="muted-copy">Useful when you first sign in with Google or Outlook. After you set a password, you can sign out and return with email + password.</p><label className="field"><span>New password</span><input type="password" minLength={8} value={password} onChange={e=>setPassword(e.target.value)} placeholder="At least 8 characters" autoComplete="new-password"/></label><label className="field"><span>Confirm password</span><input type="password" value={confirm} onChange={e=>setConfirm(e.target.value)} placeholder="Repeat the password" autoComplete="new-password"/></label>{mismatch&&<div className="login-error">Passwords do not match.</div>}<button className="primary-btn" disabled={busy||password.length<8||mismatch} onClick={()=>void save()}>{busy?'Saving…':'Save password'}</button></section>;
-}
-
-function CommandPalette({onClose,onGo,onStartFocus}:{onClose:()=>void;onGo:(v:View)=>void;onStartFocus:()=>void}){const actions:[string,View|'focus'][]=[['Open Overview','Overview'],['Open Focus','Focus'],['Open Insights','Insights'],['Open Control Center','Control'],['Open Rewards','Rewards'],['Open Leaderboard','Leaderboard'],['Open Settings','Settings'],['Start Focus now','focus']];return <div className="palette-backdrop" onClick={onClose}><div className="palette" onClick={e=>e.stopPropagation()}><div className="palette-input"><span>⌕</span><input autoFocus placeholder="Jump to a feature…"/></div>{actions.map(([label,target])=><button key={label} onClick={()=>target==='focus'?onStartFocus():onGo(target)}><span>{label}</span><kbd>↵</kbd></button>)}</div></div>;}
+function CommandPalette({onClose,onGo,onStartFocus}:{onClose:()=>void;onGo:(v:View)=>void;onStartFocus:()=>void}){const actions:[string,View|'focus'][]=[['Open Overview','Overview'],['Open Focus','Focus'],['Open Insights','Insights'],['Open Control Center','Control'],['Open Wellbeing','Wellbeing'],['Open Rewards','Rewards'],['Open Leaderboard','Leaderboard'],['Open Settings','Settings'],['Start Focus now','focus']];return <div className="palette-backdrop" onClick={onClose}><div className="palette" onClick={e=>e.stopPropagation()}><div className="palette-input"><span>⌕</span><input autoFocus placeholder="Jump to a feature…"/></div>{actions.map(([label,target])=><button key={label} onClick={()=>target==='focus'?onStartFocus():onGo(target)}><span>{label}</span><kbd>↵</kbd></button>)}</div></div>;}
 function ClosePrompt({onDismiss,onBackground,onQuit}:{onDismiss:()=>void;onBackground:()=>Promise<void>;onQuit:()=>Promise<void>}){
   return <div className="modal-backdrop">
     <div className="close-card" role="dialog" aria-modal="true" aria-labelledby="close-prompt-title">
