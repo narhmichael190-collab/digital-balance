@@ -976,3 +976,94 @@ h1,h2,h3,.hero-title-row strong,.section-label{font-family:var(--display-font)}
 :root[data-appearance="light"] .leaderboard-podium{background:linear-gradient(145deg,#ffffff,#f5f8fc)}
 .leaderboard-podium .place-1{transform:translateY(-4px)}
 .leaderboard-podium .place-2,.leaderboard-podium .place-3{transform:translateY(4px)}
+
+
+/* =========================================================
+   LIGHT MODE — SOFTER, CLEARER APP SURFACES
+   This intentionally overrides the original light palette.
+   Dark mode is untouched.
+   ========================================================= */
+:root[data-appearance="light"] {
+  --bg: #e8edf3 !important;
+  --panel: #f7f9fc !important;
+  --panel2: #edf2f7 !important;
+  --line: #cbd6e2 !important;
+  --text: #172338 !important;
+  --muted: #5f6f84 !important;
+}
+
+:root[data-appearance="light"] body,
+:root[data-appearance="light"] #root,
+:root[data-appearance="light"] .app-shell {
+  background: #e8edf3 !important;
+}
+
+:root[data-appearance="light"] .main-pane {
+  background: transparent !important;
+}
+
+:root[data-appearance="light"] .sidebar {
+  background: linear-gradient(180deg, #f7f9fc 0%, #e7edf4 100%) !important;
+  border-right-color: #cbd6e2 !important;
+  box-shadow: 8px 0 26px rgba(15,23,42,.055) !important;
+}
+
+:root[data-appearance="light"] .hero-card,
+:root[data-appearance="light"] .stat-card,
+:root[data-appearance="light"] .panel,
+:root[data-appearance="light"] .momentum-strip,
+:root[data-appearance="light"] .shop-hero,
+:root[data-appearance="light"] .live-panel,
+:root[data-appearance="light"] .focus-goal,
+:root[data-appearance="light"] .focus-card,
+:root[data-appearance="light"] .reward-card,
+:root[data-appearance="light"] .earning-card,
+:root[data-appearance="light"] .active-rule-box,
+:root[data-appearance="light"] .coin-card,
+:root[data-appearance="light"] .wellbeing-hero,
+:root[data-appearance="light"] .wellbeing-daily,
+:root[data-appearance="light"] .activity-card {
+  background: linear-gradient(145deg, #f9fbfd 0%, #f0f4f8 100%) !important;
+  border-color: #cbd6e2 !important;
+  box-shadow: 0 10px 28px rgba(15,23,42,.065) !important;
+}
+
+:root[data-appearance="light"] .app-row,
+:root[data-appearance="light"] .leader-row,
+:root[data-appearance="light"] .focus-mode-strip,
+:root[data-appearance="light"] .connection-pill,
+:root[data-appearance="light"] .profile-chip,
+:root[data-appearance="light"] .mode-switch,
+:root[data-appearance="light"] .command-btn,
+:root[data-appearance="light"] .coin-mini,
+:root[data-appearance="light"] .activity-preview-steps span {
+  background: #e6ecf2 !important;
+  border-color: #cbd6e2 !important;
+}
+
+:root[data-appearance="light"] .app-row:hover,
+:root[data-appearance="light"] .activity-card:hover {
+  background: #edf2f7 !important;
+  border-color: color-mix(in srgb, var(--accent) 25%, #cbd6e2) !important;
+}
+
+:root[data-appearance="light"] input,
+:root[data-appearance="light"] textarea,
+:root[data-appearance="light"] select,
+:root[data-appearance="light"] .smart-select-trigger,
+:root[data-appearance="light"] .shop-search {
+  background: #ffffff !important;
+  border-color: #c4d0dc !important;
+  color: #172338 !important;
+}
+
+:root[data-appearance="light"] .panel-head,
+:root[data-appearance="light"] .focus-app-toolbar,
+:root[data-appearance="light"] .sidebar-bottom {
+  border-color: #d0dae4 !important;
+}
+
+:root[data-appearance="light"] .section-label,
+:root[data-appearance="light"] .eyebrow {
+  color: #53647a !important;
+}
