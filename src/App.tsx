@@ -4,6 +4,7 @@ import type { Session, User } from '@supabase/supabase-js';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
+import { getVersion } from '@tauri-apps/api/app';
 import { check, type Update } from '@tauri-apps/plugin-updater';
 import {
   awardFocusPoints,
@@ -15,10 +16,19 @@ import {
   fetchLeaderboard,
   setupDeepLinkAuth,
   signInWithGoogle,
+  signInWithAzure,
+  signInWithEmailPassword,
+  signUpWithEmailPassword,
+  resetPasswordForEmail,
   supabase,
   supabaseConfigured,
   supabaseConfigIssue,
   updateProfileDisplayName,
+  uploadProfileAvatar,
+  removeProfileAvatar,
+  submitFeedback,
+  fetchCurrentSeasonProgress,
+  claimCurrentSeasonReward,
 } from './lib/supabase';
 import {
   completeFocusSession,
@@ -41,7 +51,8 @@ import type { AppLimit, AppMode, AppSettings, Category, LeaderboardRow, LimitAct
 
 const modes: AppMode[] = ['Casual', 'Smart', 'Deep Focus'];
 const categories: Category[] = ['Productive', 'Distracting', 'Communication', 'Media', 'Neutral'];
-type View = 'Overview' | 'Focus' | 'Insights' | 'Control' | 'Wellbeing' | 'Rewards' | 'Leaderboard' | 'Settings';
+const DAILY_TARGET_PRESETS = [30, 60, 90, 120, 180] as const;
+type View = 'Overview' | 'Focus' | 'Insights' | 'Control' | 'Wellbeing' | 'Challenges' | 'Season' | 'Rewards' | 'Leaderboard' | 'Journal' | 'Settings';
 
 const PROTECTED_EXES = new Set([
   'digital-balance.exe','liba-bilancia.exe','explorer.exe','system','system idle process',
@@ -323,7 +334,7 @@ const ACTIVITY_LIBRARY: ActivityDefinition[] = [
   ]},
 ];
 
-type ActivityRecord = { id:string; completedAt:string; coins:number };
+type ActivityRecord = { id:string; completedAt:string; points:number };
 function dayKey(date=new Date()) { return date.toDateString(); }
 function activityDefinition(id:string) { return ACTIVITY_LIBRARY.find(item=>item.id===id) ?? ACTIVITY_LIBRARY[0]; }
 
@@ -353,6 +364,10 @@ export default function App() {
   const [protectionAppsLoading, setProtectionAppsLoading] = useState(false);
   const [protectionAppsError, setProtectionAppsError] = useState('');
   const [leaderboard, setLeaderboard] = useState<LeaderboardRow[]>([]);
+  const [seasonProgress, setSeasonProgress] = useState({ points: 0, rewardClaimed: false });
+  const [seasonLoading, setSeasonLoading] = useState(false);
+  const [seasonError, setSeasonError] = useState('');
+  const [seasonClaimBusy, setSeasonClaimBusy] = useState(false);
   const [notice, setNotice] = useState('');
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -389,6 +404,7 @@ export default function App() {
   const [profileReady, setProfileReady] = useState(!supabaseConfigured);
   const [needsUsername, setNeedsUsername] = useState(false);
   const [profileDisplayName, setProfileDisplayName] = useState('');
+  const [profileAvatarUrl, setProfileAvatarUrl] = useState('');
 
   useEffect(() => { dataRef.current = data; }, [data]);
   useEffect(() => {
@@ -631,6 +647,7 @@ export default function App() {
       if (!nextSession?.user || !supabase) {
         setNeedsUsername(false);
         setProfileDisplayName('');
+        setProfileAvatarUrl('');
         setProfileReady(true);
         return;
       }
@@ -646,6 +663,7 @@ export default function App() {
         setNeedsUsername(!username || generatedUsername);
 
         if (profile) {
+          setProfileAvatarUrl(profile.avatar_url ?? '');
           const googleNames = new Set([
             nextSession.user.user_metadata?.full_name,
             nextSession.user.user_metadata?.name,
@@ -775,6 +793,39 @@ export default function App() {
   async function refreshLeaderboard() { if (!supabase) return; try { setLeaderboard(await fetchLeaderboard()); } catch (error) { console.error(error); setNotice('Could not load the global leaderboard.'); } }
   useEffect(() => { if (view === 'Leaderboard' && user) void refreshLeaderboard(); }, [view, user]);
 
+  async function refreshSeasonProgress() {
+    if (!user || !supabase || !isOnline) return;
+    setSeasonLoading(true);
+    setSeasonError('');
+    try { setSeasonProgress(await fetchCurrentSeasonProgress()); }
+    catch (error) {
+      console.error('Could not load season progress:', error);
+      setSeasonError(error instanceof Error ? error.message : 'Season progress could not be loaded. Check that the Season 01 SQL setup has been run.');
+    }
+    finally { setSeasonLoading(false); }
+  }
+  useEffect(() => { if (view === 'Season' && user) void refreshSeasonProgress(); }, [view, user, isOnline]);
+
+  async function claimSeasonFinale() {
+    if (!data || seasonClaimBusy) return;
+    setSeasonClaimBusy(true);
+    try {
+      const result = await claimCurrentSeasonReward();
+      if (!result.claimed) {
+        await refreshSeasonProgress();
+        setNotice(result.alreadyClaimed ? 'The First Light cache has already been claimed on this account.' : 'Reach 5,000 Season Points before opening the cache.');
+        return;
+      }
+      const next = await saveSettings({ ...data.settings, coins: data.settings.coins + result.coins });
+      setData(next);
+      await refreshSeasonProgress();
+      setNotice(`Season finale unlocked — ${result.coins.toLocaleString()} Balance Coins added.`);
+    } catch (error) {
+      console.error('Season reward claim failed:', error);
+      setNotice(error instanceof Error ? error.message : 'Could not claim the season reward.');
+    } finally { setSeasonClaimBusy(false); }
+  }
+
   function withClaimedCoins(current: TrackerData, reward: { coins: number }) {
     return reward.coins > 0 ? { ...current, settings: { ...current.settings, coins: current.settings.coins + reward.coins } } : current;
   }
@@ -822,6 +873,7 @@ export default function App() {
           setData(next);
         }
         setNotice(`Daily check-in: +${reward.points} leaderboard points and +${reward.coins} Balance Coins.`);
+        void refreshSeasonProgress();
       }
     } catch (error) { console.warn('Daily check-in reward unavailable', error); }
     finally { activityCheckinInFlightRef.current = false; }
@@ -878,6 +930,7 @@ export default function App() {
         try {
           const cloud = await awardFocusPoints(focusMinutes);
           nextData = await claimProgressRewards(nextData);
+          await refreshSeasonProgress();
           cloudMessage = `+${result.coins} Balance Coins and +${cloud.points} leaderboard points secured.`;
         } catch (error) {
           console.warn('Cloud reward sync failed; keeping the local session', error);
@@ -903,16 +956,16 @@ export default function App() {
   async function changeMode(mode: AppMode) { if(!data)return; setData(await saveSettings({...data.settings,mode})); if(focusRunning){ await setFocusProtection(true,focusApps,mode).then(setData).catch(()=>undefined); } }
   async function togglePause() { if(!data)return; setData(await setTrackingPaused(!data.tracking_paused)); }
   const activityTodayRecords = activityRecords.filter(item => dayKey(new Date(item.completedAt)) === dayKey());
-  const activityPointsToday = activityTodayRecords.reduce((sum,item)=>sum+item.coins,0);
+  const activityPointsToday = activityTodayRecords.reduce((sum,item)=>sum+item.points,0);
   async function startActivity(id:string) {
     const activity = activityDefinition(id);
     const todayCount = activityTodayRecords.filter(item=>item.id===id).length;
     if (activityTodayRecords.length >= 3) { setNotice('Daily wellbeing limit reached. Come back tomorrow for more activity rewards.'); return; }
     if (todayCount >= 2) { setNotice('You can complete the same activity twice per day. Try a different reset next.'); return; }
     try {
-      await invoke<{ id:string; durationSecs:number; completedSteps:number; progress:number }>('start_wellbeing_activity', { id });
+      const startedAt = await invoke<number>('start_wellbeing_activity', { activityId: id });
       setView('Wellbeing');
-      setActivitySession({id, startedAt:Date.now(), elapsed:0, step:0});
+      setActivitySession({id, startedAt, elapsed:0, step:0});
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     }
@@ -929,13 +982,13 @@ export default function App() {
     const required = activity.minutes * 60;
     if (activitySession.elapsed < required || activitySession.step < activity.steps.length - 1) { setNotice('Stay with the guided activity until the timer is complete.'); return; }
     try {
-      const result = await invoke<{ coins:number; record:ActivityRecord }>('complete_wellbeing_activity');
+      const result = await invoke<{ points:number; record:ActivityRecord }>('complete_wellbeing_activity', { activityId: activity.id });
       const records = await invoke<ActivityRecord[]>('get_wellbeing_records');
       const nextData = await getTrackerData();
       setActivityRecords(records);
       setData(nextData);
-      setNotice(result.coins > 0
-        ? `${activity.title} complete — +${result.coins} Balance Coins secured.`
+      setNotice(result.points > 0
+        ? `${activity.title} complete — +${result.points} Balance Coins secured.`
         : `${activity.title} complete. Today's wellbeing reward cap has been reached.`);
       if (activityTimerRef.current) window.clearInterval(activityTimerRef.current);
       activityTimerRef.current = null;
@@ -951,7 +1004,7 @@ export default function App() {
     const requiredPerStep=Math.ceil((activity.minutes*60)/activity.steps.length);
     if (activitySession.elapsed < requiredPerStep*(activitySession.step+1)) { setNotice('Keep going a little longer before moving to the next step.'); return; }
     try {
-      await invoke('advance_wellbeing_step');
+      await invoke('advance_wellbeing_step', { activityId: activity.id, stepIndex: nextStep });
       setActivitySession({...activitySession,step:nextStep});
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
@@ -985,7 +1038,7 @@ export default function App() {
 
   if(!authReady) return <Splash/>;
   if(!supabaseConfigured) return <CloudSetupScreen issue={supabaseConfigIssue ?? 'Cloud authentication is not configured.'}/>;
-  if(!session) return <LoginScreen onLogin={signInWithGoogle} notice={notice}/>;
+  if(!session) return <LoginScreen onGoogleLogin={signInWithGoogle} onMicrosoftLogin={signInWithAzure} notice={notice}/>;
   if(needsUsername && user) return <UsernameSetup user={user} onComplete={async(username)=>{ await updateProfileUsername(username); setProfileDisplayName(username); if(data) setData({...data,settings:{...data.settings,displayName:username}}); setNeedsUsername(false); setNotice(`Welcome, ${username}.`); }} />;
   if(!profileReady || !data) return <Splash/>;
 
@@ -998,12 +1051,13 @@ export default function App() {
   return <div className={rootClass} data-mode={data.settings.mode.replace(' ', '-')}>
     <aside className="sidebar">
       <div className="brand-row"><div className="brand"><BrandMark />{!sidebarCollapsed&&<div><strong>Liba Bilancia</strong><span>Own your screen time.</span></div>}</div><button className="sidebar-toggle" onClick={()=>setSidebarCollapsed(v=>!v)} title={sidebarCollapsed?'Show sidebar':'Hide sidebar'} aria-label={sidebarCollapsed?'Show sidebar':'Hide sidebar'}><Icon name="menu" size={17}/></button></div>
-            <nav className="nav-list">{([['Overview','grid'],['Focus','focus'],['Insights','insights'],['Control','control'],['Wellbeing','activity'],['Rewards','shop'],['Leaderboard','trophy'],['Settings','settings']] as [View,string][]).map(([id,icon])=><button key={id} className={`nav-item ${view===id?'active':''}`} onClick={()=>go(id)} title={id}><Icon name={icon}/>{!sidebarCollapsed&&<span>{id}</span>}</button>)}</nav>
+            <nav className="nav-list">{([['Overview','grid'],['Focus','focus'],['Insights','insights'],['Control','control'],['Wellbeing','activity'],['Challenges','target'],['Season','sparkles'],['Rewards','shop'],['Leaderboard','trophy'],['Journal','book-open'],['Settings','settings']] as [View,string][]).map(([id,icon])=><button key={id} className={`nav-item ${view===id?'active':''}`} onClick={()=>go(id)} title={id}><Icon name={icon}/>{!sidebarCollapsed&&<span>{id}</span>}</button>)}</nav>
+      <div className="sidebar-progress" aria-label="Daily focus progress"><div className="sidebar-progress-head"><span>Daily Focus</span><strong>{Math.round(Math.min(100,(today.focus/Math.max(1,data.settings.dailyFocusTargetMinutes))*100))}%</strong></div><div className="sidebar-progress-bar"><span style={{width:`${Math.min(100,(today.focus/Math.max(1,data.settings.dailyFocusTargetMinutes))*100)}%`}}/></div><div className="sidebar-progress-row"><span>{today.focus} / {data.settings.dailyFocusTargetMinutes} min</span><strong className="sidebar-streak">🔥 {streak}d</strong></div></div>
       <div className="sidebar-bottom"><div className="coin-mini"><span>{sidebarCollapsed?'Coins':'Balance Coins'}</span><strong>{data.settings.coins.toLocaleString()}</strong></div><button className="pause-btn" onClick={()=>void togglePause()}>{sidebarCollapsed?(data.tracking_paused?'▶':'Ⅱ'):(data.tracking_paused?'Resume tracking':'Pause tracking')}</button></div>
     </aside>
 
     <main className="main-pane">
-      <header className="topbar"><div><div className="eyebrow">{new Date().toLocaleDateString(undefined,{weekday:'long',month:'long',day:'numeric'})}</div><h1>{view}</h1></div><div className="top-actions"><button className="command-btn" onClick={()=>setPaletteOpen(true)}><span>Command</span><kbd>Ctrl K</kbd></button><div className="mode-switch">{modes.map(mode=><button key={mode} className={data.settings.mode===mode?'selected':''} onClick={()=>void changeMode(mode)}>{mode}</button>)}</div><span className={`connection-pill ${isOnline?'online':'offline'}`} role="status" title={isOnline?'Cloud features available':'Tracking continues locally; cloud features need internet'}><i aria-hidden="true"/>{isOnline?'Online':'Offline'}</span><div className="profile-chip"><div className="avatar">{displayName.slice(0,1).toUpperCase()}</div><strong>{displayName}</strong><button className="signout" onClick={()=>void supabase?.auth.signOut()}>Sign out</button></div></div></header>
+      <header className="topbar"><div><div className="eyebrow">{new Date().toLocaleDateString(undefined,{weekday:'long',month:'long',day:'numeric'})}</div><h1>{view}</h1></div><div className="top-actions"><button className="command-btn" onClick={()=>setPaletteOpen(true)}><span>Command</span><kbd>Ctrl K</kbd></button><div className="mode-switch">{modes.map(mode=><button key={mode} className={data.settings.mode===mode?'selected':''} onClick={()=>void changeMode(mode)}>{mode}</button>)}</div><span className={`connection-pill ${isOnline?'online':'offline'}`} role="status" title={isOnline?'Cloud features available':'Tracking continues locally; cloud features need internet'}><i aria-hidden="true"/>{isOnline?'Online':'Offline'}</span><div className="profile-chip"><div className="avatar">{profileAvatarUrl?<img src={profileAvatarUrl} alt=""/>:displayName.slice(0,1).toUpperCase()}</div><strong>{displayName}</strong><button className="signout" onClick={()=>void supabase?.auth.signOut()}>Sign out</button></div></div></header>
       {!isOnline&&<div className="offline-banner"><strong>Offline mode</strong><span>Liba Bilancia keeps tracking locally. Sign-in, leaderboard sync, activity rewards and updates need an internet connection.</span></div>}{notice&&<button className="notice" onClick={()=>setNotice('')}><span>{notice}</span><span>×</span></button>}
       {update&&<div className={`update-banner ${updatePhase==='downloading'?'is-downloading':''}`} role="status">
         <div className="update-copy">
@@ -1030,10 +1084,13 @@ export default function App() {
       {view==='Insights'&&<Insights data={data} weekly={weekly} topApps={topApps}/>} 
       {view==='Control'&&<ControlPage data={data} topApps={appOptions} runningApps={runningApps} protectionApps={protectionApps} protectionAppsLoading={protectionAppsLoading} protectionAppsError={protectionAppsError} onRefreshProtectionApps={refreshProtectionApps} onSaveLimit={saveLimit} onRemoveLimit={removeLimit} focusApps={focusApps} setFocusApps={setFocusApps}/>}
       {view==='Wellbeing'&&<WellbeingPage records={activityRecords} todayRecords={activityTodayRecords} todayPoints={activityPointsToday} session={activitySession} onStart={startActivity} onAdvance={advanceActivityStep} onComplete={completeActivity} onCancel={stopActivity}/>}
+      {view==='Challenges'&&<ChallengesPage data={data} streak={streak} />}
+      {view==='Season'&&<SeasonPage progress={seasonProgress} loading={seasonLoading} error={seasonError} online={isOnline} claiming={seasonClaimBusy} onRefresh={refreshSeasonProgress} onClaim={claimSeasonFinale}/>}
  
       {view==='Rewards'&&<RewardsPage data={data} rewards={rewards} filter={shopFilter} setFilter={setShopFilter} search={themeSearch} setSearch={setThemeSearch} preview={themePreview} onPreview={beginThemePreview} onBuy={buyReward} onEquip={equip} onApplyTheme={applyTheme} onResetPreview={endThemePreview}/>} 
       {view==='Leaderboard'&&<Leaderboard data={leaderboard} userId={user?.id ?? ''} refresh={refreshLeaderboard}/>} 
-      {view==='Settings'&&<SettingsPage data={data} setData={setData} user={user} appearance={appearance} onAppearanceChange={changeAppearance} onSaveDisplayName={saveDisplayName} onCheckForUpdates={checkForUpdates} updateCheckBusy={updateBusy}/>} 
+      {view==='Journal'&&<JournalPage userId={user?.id ?? 'local-user'}/>}
+      {view==='Settings'&&<SettingsPage data={data} setData={setData} user={user} appearance={appearance} onAppearanceChange={changeAppearance} onSaveDisplayName={saveDisplayName} onCheckForUpdates={checkForUpdates} updateCheckBusy={updateBusy} profileAvatarUrl={profileAvatarUrl} onAvatarSaved={setProfileAvatarUrl}/>} 
     </main>
 
     {paletteOpen&&<CommandPalette onClose={()=>setPaletteOpen(false)} onGo={go} onStartFocus={()=>{setPaletteOpen(false);setView('Focus');void startFocus();}}/>}
@@ -1073,9 +1130,62 @@ function UsernameSetup({user,onComplete}:{user:User;onComplete:(username:string)
 
   return <div className="login-screen username-screen"><div className="login-card username-card"><BrandMark big/><div className="eyebrow">One-time setup</div><h1>Choose your username.</h1><p>This is the name Liba Bilancia will use for your profile and leaderboard identity.</p><label className="field"><span>Username</span><input autoFocus maxLength={20} value={value} onChange={e=>setValue(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g,''))} onKeyDown={e=>{if(e.key==='Enter')void submit()}} placeholder="your_username"/></label><div className={`username-status ${status}`}><span className="status-dot"/>{message}</div><button className="primary-btn wide" disabled={!canContinue} onClick={()=>void submit()}>{busy?'Saving…':'Continue'}</button><div className="privacy-note">Signed in as {user.email ?? 'your Google account'}.</div></div></div>;}
 
-function LoginScreen({onLogin,notice}:{onLogin:()=>Promise<void>;notice:string}){return <div className="login-screen"><div className="login-card"><BrandMark big /><div className="eyebrow">Liba Bilancia</div><h1>A smarter relationship with your screen.</h1><p>Track Windows usage, set real limits, earn rewards, run Focus, and compare progress without sending detailed activity to the cloud.</p><button className="google-btn" onClick={()=>void onLogin()}><span>G</span> Continue with Google</button><div className="privacy-note">Detailed activity remains local. Only the minimum leaderboard data is synchronized.</div>{notice&&<div className="login-error">{notice}</div>}</div></div>;}
+function LoginScreen({onGoogleLogin,onMicrosoftLogin,notice}:{onGoogleLogin:()=>Promise<void>;onMicrosoftLogin:()=>Promise<void>;notice:string}){
+  const [method,setMethod]=useState<'choices'|'email'>('choices');
+  const [email,setEmail]=useState('');
+  const [password,setPassword]=useState('');
+  const [confirmPassword,setConfirmPassword]=useState('');
+  const [mode,setMode]=useState<'signin'|'signup'>('signin');
+  const [busy,setBusy]=useState(false);
+  const [message,setMessage]=useState('');
 
-function Overview({data,score,today,topApps,streak,onStartFocus,onGo,currentRemaining,appName}:{data:TrackerData;score:number;today:{tracked:number;productive:number;distracting:number;focus:number};topApps:{name:string;exe:string;category:Category;secs:number}[];streak:number;onStartFocus:()=>void;onGo:(view:View)=>void;currentRemaining:number|null;appName:string}){const progress=Math.min(100,(today.focus/Math.max(1,data.settings.dailyFocusTargetMinutes))*100);const hour=new Date().getHours();const greeting=hour<12?'Good morning':hour<18?'Good afternoon':'Good evening';return <div className="content-grid home-v2"><section className="home-greeting"><div><span className="section-label">{new Date().toLocaleDateString(undefined,{weekday:'long',month:'long',day:'numeric'})}</span><h2>{greeting}, {data.settings.displayName||'there'}.</h2><p>Choose what deserves your attention next.</p></div><button className="ghost-btn" onClick={()=>onGo('Wellbeing')}>Take a wellbeing break</button></section><section className="home-glow-bars" aria-hidden="true">{[1,2,3,4,5,6,7].map(i=><i key={i}/>)}</section><section className="hero-grid"><div className="hero-card hero-main"><span className="section-label">Liba Bilancia Score</span><div className="hero-title-row"><div><h2>{score>=80?'Locked in.':score>=60?'Good momentum.':'Time to reset.'}</h2><p>Your score combines focus, productive time and distraction control — not just raw screen time.</p><div className="hero-actions"><button className="primary-btn" onClick={onStartFocus}>Start Focus</button><button className="ghost-btn" onClick={()=>onGo('Control')}>Tune limits</button></div></div><div className="score-ring" style={{'--score':`${score}%`} as CSSProperties}><span>{score}</span></div></div></div><div className="stat-card"><span>Tracked today</span><strong>{time(today.tracked)}</strong><small>{minutes(today.productive)}m productive · {minutes(today.distracting)}m distracting</small></div><div className="stat-card"><span>Focus streak</span><strong>{streak}d</strong><small>{streak>0?'Keep the run alive.':'Complete a Focus session today.'}</small></div></section><section className="live-grid"><div className="panel live-panel"><div className="panel-head"><div><span className="section-label">Active Now</span><h3>{appName}</h3></div><span className={`live-chip ${data.tracking_paused?'off':''}`}>{data.tracking_paused?'Paused':'Live'}</span></div><div className="live-meta"><span>{data.current_category ?? 'Neutral'}</span><span>{time(data.current_session_secs)} current session</span>{currentRemaining!==null&&<span>{currentRemaining}m left on protection</span>}</div><div className="signal">{[1,2,3,4,5].map(i=><i key={i}/>)}</div></div><div className="panel focus-goal"><span className="section-label">TODAY'S FOCUS</span><strong>{today.focus} / {data.settings.dailyFocusTargetMinutes}m</strong><p>Complete the target to strengthen your Balance score and earn Coins.</p><div className="progress"><span style={{width:`${progress}%`}}/></div></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Usage</span><h3>Most-used apps</h3></div><button className="text-btn" onClick={()=>onGo('Insights')}>Open insights →</button></div><div className="app-list">{topApps.length?topApps.slice(0,8).map(app=><div className="app-row" key={app.exe}><div className="app-name"><span className={`category-dot ${app.category.toLowerCase()}`}/><div className="app-name-copy"><strong title={app.exe}>{app.name}</strong><span>{app.category}</span></div></div><div className="app-bar"><span style={{width:`${Math.max(3,(app.secs/topApps[0].secs)*100)}%`}}/></div><strong className="app-time">{time(app.secs)}</strong></div>):<div className="empty">Use the computer for a bit and your real app history will appear here.</div>}</div></section><section className="momentum-strip"><div><span className="section-label">Momentum</span><strong>{today.distracting<=data.settings.dailyDistractionLimitMinutes*60?'Within distraction limit':'Over your distraction target'}</strong><small>Liba Bilancia updates this in the background while you work.</small></div><button className="ghost-btn" onClick={()=>onGo('Rewards')}>Open Reward Lab</button></section></div>;}
+  const run=async(action:()=>Promise<void>)=>{
+    if(busy)return;
+    setBusy(true);setMessage('');
+    try{await action();}
+    catch(error){setMessage(error instanceof Error?error.message:'Could not complete that request.');}
+    finally{setBusy(false);}
+  };
+
+  const submitEmail=async()=>{
+    const clean=email.trim();
+    if(!clean||!password){setMessage('Enter your email and password.');return;}
+    if(mode==='signup'&&password!==confirmPassword){setMessage('Your passwords do not match.');return;}
+    await run(async()=>{
+      if(mode==='signin'){
+        await signInWithEmailPassword(clean,password);
+      }else{
+        const data=await signUpWithEmailPassword(clean,password);
+        if(!data.session) setMessage('Account created. Check your email to confirm your account, then come back and sign in.');
+      }
+    });
+  };
+
+  const forgot=async()=>{
+    if(!email.trim()){setMessage('Enter your email first.');return;}
+    await run(async()=>{await resetPasswordForEmail(email);setMessage('Password reset link sent. Check your email.');});
+  };
+
+  return <div className="login-screen"><div className="login-card login-card-auth"><BrandMark big/><div className="eyebrow">Liba Bilancia</div><h1>A smarter relationship with your screen.</h1><p>Track Windows usage, set real limits, earn rewards, run Focus, and compare progress without sending detailed activity to the cloud.</p>
+    {method==='choices'?<>
+      <button className="google-btn" disabled={busy} onClick={()=>void run(onGoogleLogin)}><span>G</span> Continue with Google</button>
+      <button className="microsoft-btn" disabled={busy} onClick={()=>void run(onMicrosoftLogin)}><span className="microsoft-mark"><i/><i/><i/><i/></span> Continue with Microsoft</button>
+      <button className="email-login-btn" disabled={busy} onClick={()=>{setMethod('email');setMessage('');}}><span>✉</span> Continue with Email</button>
+    </>:<>
+      <div className="auth-back-row"><button className="text-btn" onClick={()=>{setMethod('choices');setMessage('');}}>← All sign-in options</button></div>
+      <div className="auth-mode-tabs"><button className={mode==='signin'?'active':''} onClick={()=>{setMode('signin');setMessage('');}}>Sign in</button><button className={mode==='signup'?'active':''} onClick={()=>{setMode('signup');setMessage('');}}>Create account</button></div>
+      <label className="field"><span>Email</span><input autoFocus type="email" autoComplete="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com" onKeyDown={e=>{if(e.key==='Enter')void submitEmail()}}/></label>
+      <label className="field"><span>Password</span><input type="password" autoComplete={mode==='signin'?'current-password':'new-password'} value={password} onChange={e=>setPassword(e.target.value)} placeholder="At least 8 characters" onKeyDown={e=>{if(e.key==='Enter')void submitEmail()}}/></label>
+      {mode==='signup'&&<label className="field"><span>Confirm password</span><input type="password" autoComplete="new-password" value={confirmPassword} onChange={e=>setConfirmPassword(e.target.value)} placeholder="Repeat your password" onKeyDown={e=>{if(e.key==='Enter')void submitEmail()}}/></label>}
+      <button className="primary-btn wide" disabled={busy} onClick={()=>void submitEmail()}>{busy?(mode==='signin'?'Signing in…':'Creating account…'):(mode==='signin'?'Sign in':'Create account')}</button>
+      {mode==='signin'&&<button className="forgot-btn" disabled={busy} onClick={()=>void forgot()}>Forgot your password?</button>}
+    </>}
+    <div className="privacy-note">Detailed activity remains local. Only the minimum leaderboard data is synchronized.</div>
+    {(message||notice)&&<div className="login-error">{message||notice}</div>}
+  </div></div>;
+}
+
+function Overview({data,score,today,topApps,streak,onStartFocus,onGo,currentRemaining,appName}:{data:TrackerData;score:number;today:{tracked:number;productive:number;distracting:number;focus:number};topApps:{name:string;exe:string;category:Category;secs:number}[];streak:number;onStartFocus:()=>void;onGo:(view:View)=>void;currentRemaining:number|null;appName:string}){const progress=Math.min(100,(today.focus/Math.max(1,data.settings.dailyFocusTargetMinutes))*100);const [clock,setClock]=useState(()=>new Date());useEffect(()=>{const id=window.setInterval(()=>setClock(new Date()),30000);return()=>window.clearInterval(id)},[]);const hour=clock.getHours();const greeting=hour<5||hour>=18?'Good evening':hour<12?'Good morning':'Good afternoon';const greetingEmoji=hour<5||hour>=18?'🌙':hour<12?'☀️':'🌤️';const targetReached=today.focus>=data.settings.dailyFocusTargetMinutes;const focusTargetLeft=Math.max(0,data.settings.dailyFocusTargetMinutes-today.focus);return <div className="content-grid home-v2"><section className="home-greeting"><div><span className="section-label">{clock.toLocaleDateString(undefined,{weekday:'long',month:'long',day:'numeric'})}</span><h2>{greetingEmoji} {greeting}, {data.settings.displayName||'there'}.</h2><p>{hour<5?'A quiet night starts here.':hour<12?'Start the day with a clear head and one good Focus session.':hour<18?'Keep the momentum going — you still have time to shape the day.':'Wind down well and protect the progress you made today.'}</p></div><button className="ghost-btn" onClick={()=>onGo('Wellbeing')}>Take a wellbeing break</button></section><section className="home-glow-bars" aria-hidden="true">{[1,2,3,4,5,6,7].map(i=><i key={i}/>)}</section><section className="hero-grid"><div className="hero-card hero-main"><span className="section-label">Liba Bilancia Score</span><div className="hero-title-row"><div><h2>{score>=80?'Locked in.':score>=60?'Good momentum.':'Time to reset.'}</h2><p>Your score combines focus, productive time and distraction control — not just raw screen time.</p><div className="hero-actions"><button className="primary-btn" onClick={onStartFocus}>Start Focus</button><button className="ghost-btn" onClick={()=>onGo('Control')}>Tune limits</button></div></div><div className="score-ring" style={{'--score':`${score}%`} as CSSProperties}><span>{score}</span></div></div></div><div className="stat-card"><span>Tracked today</span><strong>{time(today.tracked)}</strong><small>{minutes(today.productive)}m productive · {minutes(today.distracting)}m distracting</small></div><div className="stat-card"><span>Focus streak</span><strong>{streak}d</strong><small>{streak>0?'Keep the run alive.':'Complete a Focus session today.'}</small></div></section><section className="daily-target-card panel"><div className="daily-target-main"><div className="panel-head"><div><span className="section-label">DAILY TARGET</span><h3>{targetReached?'Target reached.':'Build today’s focus total.'}</h3></div><span className={`target-status ${targetReached?'complete':''}`}>{targetReached?'✓ Complete':'In progress'}</span></div><div className="daily-target-value"><strong>{today.focus} <span>/ {data.settings.dailyFocusTargetMinutes} min</span></strong><b>{Math.round(progress)}%</b></div><div className="daily-target-progress"><span style={{width:`${progress}%`}}/></div><p>{targetReached?'Your daily Focus target is complete. The daily reward is claimed automatically after a qualifying Focus session while you are signed in.':`${focusTargetLeft} min left to reach your target. Complete it through Focus with controls active.`}</p></div><button className="ghost-btn daily-target-settings" onClick={()=>onGo('Settings')}>Change target</button></section><section className="live-grid"><div className="panel live-panel"><div className="panel-head"><div><span className="section-label">Active Now</span><h3>{appName}</h3></div><span className={`live-chip ${data.tracking_paused?'off':''}`}>{data.tracking_paused?'Paused':'Live'}</span></div><div className="live-meta"><span>{data.current_category ?? 'Neutral'}</span><span>{time(data.current_session_secs)} current session</span>{currentRemaining!==null&&<span>{currentRemaining}m left on protection</span>}</div><div className="signal">{[1,2,3,4,5].map(i=><i key={i}/>)}</div></div><div className="panel focus-goal"><span className="section-label">TODAY'S FOCUS</span><strong>{today.focus} / {data.settings.dailyFocusTargetMinutes}m</strong><p>{targetReached?'Daily target complete. Keep going to build an even stronger streak.':'Complete the target to strengthen your Balance score and earn the daily reward.'}</p><div className="progress"><span style={{width:`${progress}%`}}/></div></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Usage</span><h3>Most-used apps</h3></div><button className="text-btn" onClick={()=>onGo('Insights')}>Open insights →</button></div><div className="app-list">{topApps.length?topApps.slice(0,8).map(app=><div className="app-row" key={app.exe}><div className="app-name"><span className={`category-dot ${app.category.toLowerCase()}`}/><div className="app-name-copy"><strong title={app.exe}>{app.name}</strong><span>{app.category}</span></div></div><div className="app-bar"><span style={{width:`${Math.max(3,(app.secs/topApps[0].secs)*100)}%`}}/></div><strong className="app-time">{time(app.secs)}</strong></div>):<div className="empty">Use the computer for a bit and your real app history will appear here.</div>}</div></section><section className="momentum-strip"><div><span className="section-label">Momentum</span><strong>{today.distracting<=data.settings.dailyDistractionLimitMinutes*60?'Within distraction limit':'Over your distraction target'}</strong><small>Liba Bilancia updates this in the background while you work.</small></div><button className="ghost-btn" onClick={()=>onGo('Rewards')}>Open Reward Lab</button></section></div>;}
 
 function FocusPage({
   data,
@@ -1356,7 +1466,7 @@ function FocusPage({
   );
 }
 
-function Insights({data,weekly,topApps}:{data:TrackerData;weekly:{label:string;productive:number;distracting:number;total:number}[];topApps:{name:string;exe:string;category:Category;secs:number}[]}){const max=Math.max(1,...weekly.map(x=>x.total));const consistency=Array.from({length:14},(_,index)=>{const date=new Date();date.setHours(12,0,0,0);date.setDate(date.getDate()-(13-index));const key=date.toDateString();const minutes=data.focus_sessions.filter(s=>new Date(s.completed_at).toDateString()===key).reduce((a,s)=>a+s.minutes,0);return {key,label:date.toLocaleDateString(undefined,{weekday:'short'}),day:date.getDate(),minutes};});const recentFocus=[...data.focus_sessions].sort((a,b)=>new Date(b.completed_at).getTime()-new Date(a.completed_at).getTime()).slice(0,8);return <div className="insights-grid"><section className="panel"><div className="panel-head"><div><span className="section-label">Last 7 Days</span><h3>Usage rhythm</h3></div><span className="mini-pill">Live</span></div><div className="week-chart">{weekly.map(day=><div className="week-day" key={day.label}><div className="stack"><i className="productive" style={{height:`${(day.productive/max)*190}px`}}/><i className="distracting" style={{height:`${(day.distracting/max)*190}px`}}/></div><small>{day.label}</small></div>)}</div></section><section className="panel"><span className="section-label">Session Patterns</span><div className="metric-list"><div><span>Longest session</span><strong>{time(Math.max(0,...data.sessions.map(s=>s.duration_secs)))}</strong></div><div><span>Most-used app</span><strong>{topApps[0]?.name??'No data yet'}</strong></div><div><span>Focus completions</span><strong>{data.focus_sessions.length}</strong></div><div><span>Coins earned</span><strong>{data.focus_sessions.reduce((a,s)=>a+s.coins,0)}</strong></div></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Focus Consistency</span><h3>Last 14 days</h3></div><span className="mini-pill">{consistency.filter(d=>d.minutes>0).length} active days</span></div><div className="consistency-grid">{consistency.map(day=><div className={`consistency-day ${day.minutes>0?'active':''}`} key={day.key} title={`${day.label} ${day.day}: ${day.minutes} min`}><span style={{opacity:Math.min(1,0.25+day.minutes/60)}}>{day.day}</span></div>)}</div><div className="consistency-legend"><span><i className="consistency-dot"/> Focus completed</span><span>{consistency.reduce((a,d)=>a+d.minutes,0)} min total</span></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Recent Focus</span><h3>Latest completed sessions</h3></div><span className="mini-pill">{recentFocus.length} shown</span></div><div className="focus-history-list">{recentFocus.length?recentFocus.map((item,index)=><div className="focus-history-row" key={`${item.completed_at}-${index}`}><div><strong>{item.minutes} min · {item.mode}</strong><small>{new Date(item.completed_at).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</small></div><div><span>{item.coins} coins</span><b>{item.coins} focus pts</b></div></div>):<div className="empty">Complete a Focus session and your history will appear here.</div>}</div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Top Apps</span><h3>Where your time goes</h3></div></div><div className="rank-list">{topApps.slice(0,10).map((app,i)=><div key={app.exe}><span className="rank-num">#{String(i+1).padStart(2,'0')}</span><div className="rank-app-copy"><strong>{app.name}</strong><small>{app.category}</small></div><b>{time(app.secs)}</b></div>)}</div></section></div>;}
+function Insights({data,weekly,topApps}:{data:TrackerData;weekly:{label:string;productive:number;distracting:number;total:number}[];topApps:{name:string;exe:string;category:Category;secs:number}[]}){const max=Math.max(1,...weekly.map(x=>x.total));const consistency=Array.from({length:14},(_,index)=>{const date=new Date();date.setHours(12,0,0,0);date.setDate(date.getDate()-(13-index));const key=date.toDateString();const minutes=data.focus_sessions.filter(s=>new Date(s.completed_at).toDateString()===key).reduce((a,s)=>a+s.minutes,0);return {key,label:date.toLocaleDateString(undefined,{weekday:'short'}),day:date.getDate(),minutes};});const recentFocus=[...data.focus_sessions].sort((a,b)=>new Date(b.completed_at).getTime()-new Date(a.completed_at).getTime()).slice(0,8);return <div className="insights-grid"><section className="panel"><div className="panel-head"><div><span className="section-label">Last 7 Days</span><h3>Usage rhythm</h3></div><span className="mini-pill">Live</span></div><div className="week-chart">{weekly.map(day=><div className="week-day" key={day.label}><div className="stack"><i className="productive" style={{height:`${(day.productive/max)*190}px`}}/><i className="distracting" style={{height:`${(day.distracting/max)*190}px`}}/></div><small>{day.label}</small></div>)}</div></section><section className="panel"><span className="section-label">Session Patterns</span><div className="metric-list"><div><span>Longest session</span><strong>{time(Math.max(0,...data.sessions.map(s=>s.duration_secs)))}</strong></div><div><span>Most-used app</span><strong>{topApps[0]?.name??'No data yet'}</strong></div><div><span>Focus completions</span><strong>{data.focus_sessions.length}</strong></div><div><span>Coins earned</span><strong>{data.focus_sessions.reduce((a,s)=>a+s.coins,0)}</strong></div></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Focus Consistency</span><h3>Last 14 days</h3></div><span className="mini-pill">{consistency.filter(d=>d.minutes>0).length} active days</span></div><div className="consistency-grid">{consistency.map(day=><div className={`consistency-day ${day.minutes>0?'active':''}`} key={day.key} title={`${day.label} ${day.day}: ${day.minutes} min`}><span style={{opacity:Math.min(1,0.25+day.minutes/60)}}>{day.day}</span></div>)}</div><div className="consistency-legend"><span><i className="consistency-dot"/> Focus completed</span><span>{consistency.reduce((a,d)=>a+d.minutes,0)} min total</span></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Recent Focus</span><h3>Latest completed sessions</h3></div><span className="mini-pill">{recentFocus.length} shown</span></div><div className="focus-history-list">{recentFocus.length?recentFocus.map((item,index)=><div className="focus-history-row" key={`${item.completed_at}-${index}`}><div><strong>{item.minutes} min · {item.mode}</strong><small>{new Date(item.completed_at).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</small></div><div><span>{item.coins} coins</span><b>{item.points} focus pts</b></div></div>):<div className="empty">Complete a Focus session and your history will appear here.</div>}</div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Top Apps</span><h3>Where your time goes</h3></div></div><div className="rank-list">{topApps.slice(0,10).map((app,i)=><div key={app.exe}><span className="rank-num">#{String(i+1).padStart(2,'0')}</span><div className="rank-app-copy"><strong>{app.name}</strong><small>{app.category}</small></div><b>{time(app.secs)}</b></div>)}</div></section></div>;}
 
 function AppPicker({apps,value,onChange,onClose,onRefresh,loading,error}:{apps:{name:string;exe:string;category?:Category;secs?:number;running?:boolean;recent?:boolean;installed?:boolean}[];value:string;onChange:(exe:string)=>void;onClose:()=>void;onRefresh:()=>Promise<void>;loading:boolean;error:string}){
   const [query,setQuery]=useState('');
@@ -1414,10 +1524,11 @@ function ControlPage({data,topApps,runningApps,protectionApps,protectionAppsLoad
 function WellbeingPage({records,todayRecords,todayPoints,session,onStart,onAdvance,onComplete,onCancel}:{records:ActivityRecord[];todayRecords:ActivityRecord[];todayPoints:number;session:{id:string;startedAt:number;elapsed:number;step:number}|null;onStart:(id:string)=>void;onAdvance:()=>void;onComplete:()=>void;onCancel:()=>void}){
   if(session){
     const activity=activityDefinition(session.id); const total=activity.minutes*60; const progress=Math.min(100,(session.elapsed/total)*100); const current=activity.steps[session.step]; const minPerStep=Math.ceil(total/activity.steps.length); const stepReady=session.elapsed>=minPerStep*(session.step+1); const finished=session.elapsed>=total&&session.step>=activity.steps.length-1;
-    return <div className="wellbeing-page wellbeing-session"><section className="panel wellbeing-session-card"><div className="wellbeing-session-top"><div><span className="section-label">{activity.category}</span><h2>{activity.title}</h2><p>{activity.purpose}</p></div><button className="ghost-btn small" onClick={onCancel}>Exit</button></div><div className="wellbeing-timer"><strong>{String(Math.floor((total-session.elapsed)/60)).padStart(2,'0')}:{String((total-session.elapsed)%60).padStart(2,'0')}</strong><span>{Math.round(progress)}% complete</span></div><div className="wellbeing-progress"><span style={{width:`${progress}%`}}/></div><div className="activity-step"><div className="step-number">{String(session.step+1).padStart(2,'0')}</div><div><span>GUIDED STEP</span><h3>{current.title}</h3><p>{current.detail}</p></div></div><div className="activity-step-list">{activity.steps.map((step,i)=><div key={step.title} className={`activity-step-dot ${i<session.step?'done':''} ${i===session.step?'current':''}`}><span>{i<session.step?'✓':String(i+1)}</span><strong>{step.title}</strong></div>)}</div><div className="wellbeing-session-actions"><button className="ghost-btn" disabled={!stepReady || session.step>=activity.steps.length-1} onClick={onAdvance}>{session.step>=activity.steps.length-1?'Final step':'Next step'}</button><button className="primary-btn" disabled={!finished} onClick={onComplete}>{finished?'Complete & earn coins':'Keep going'}</button></div><small className="wellbeing-fairness">Rewards unlock only after the guided timer is complete. You can earn up to 3 activity rewards per day.</small></section></div>;
+    return <div className="wellbeing-page wellbeing-session"><section className="panel wellbeing-session-card"><div className="wellbeing-session-top"><div><span className="section-label">{activity.category}</span><h2>{activity.title}</h2><p>{activity.purpose}</p></div><button className="ghost-btn small" onClick={onCancel}>Exit</button></div><div className="wellbeing-timer"><strong>{String(Math.floor((total-session.elapsed)/60)).padStart(2,'0')}:{String((total-session.elapsed)%60).padStart(2,'0')}</strong><span>{Math.round(progress)}% complete</span></div><div className="wellbeing-progress"><span style={{width:`${progress}%`}}/></div><div className="activity-step"><div className="step-number">{String(session.step+1).padStart(2,'0')}</div><div><span>GUIDED STEP</span><h3>{current.title}</h3><p>{current.detail}</p></div></div><div className="activity-step-list">{activity.steps.map((step,i)=><div key={step.title} className={`activity-step-dot ${i<session.step?'done':''} ${i===session.step?'current':''}`}><span>{i<session.step?'✓':String(i+1)}</span><strong>{step.title}</strong></div>)}</div><div className="wellbeing-session-actions"><button className="ghost-btn" disabled={!stepReady || session.step>=activity.steps.length-1} onClick={onAdvance}>{session.step>=activity.steps.length-1?'Final step':'Next step'}</button><button className="primary-btn" disabled={!finished} onClick={onComplete}>{finished?'Complete & earn points':'Keep going'}</button></div><small className="wellbeing-fairness">Rewards unlock only after the guided timer is complete. You can earn up to 3 activity rewards per day.</small></section></div>;
   }
   const groups=(['BREATHE','FLOW','ENERGISE','UNPLUG','RESET'] as const).map(category=>({category,items:ACTIVITY_LIBRARY.filter(a=>a.category===category)}));
-  return <div className="wellbeing-page"><section className="wellbeing-hero panel"><div><span className="section-label">WELLBEING</span><h2>Take a real break, not another tab.</h2><p>Short guided activities for calm, movement, recovery, and healthier screen routines. Every activity tells you exactly what to do.</p></div><div className="wellbeing-score"><strong>{todayPoints}</strong><span>points today</span><small>{todayRecords.length}/3 rewarded sessions</small></div></section><div className="wellbeing-daily panel"><div><span className="section-label">TODAY</span><h3>Your wellbeing rhythm</h3></div><div className="wellbeing-metrics"><div><strong>{todayRecords.length}</strong><span>completed</span></div><div><strong>{todayPoints}</strong><span>points</span></div><div><strong>{records.length}</strong><span>all-time sessions</span></div></div></div>{groups.map(group=><section className="wellbeing-group" key={group.category}><div className="wellbeing-group-head"><div><span className="section-label">{group.category}</span><h3>{group.category==='BREATHE'?'Mindfulness & breathing':group.category==='FLOW'?'Yoga & stretching':group.category==='ENERGISE'?'Light movement':group.category==='UNPLUG'?'Outdoor & social':'Small practical resets'}</h3></div><span className="mini-pill">{group.items.length} activities</span></div><div className="activity-grid">{group.items.map(activity=><article className="activity-card panel" key={activity.id}><div className="activity-card-top"><span className="activity-duration">{activity.minutes} min</span><span className="activity-mark">{activity.category.slice(0,1)}</span></div><h4>{activity.title}</h4><p>{activity.summary}</p><div className="activity-preview-steps">{activity.steps.slice(0,2).map(step=><span key={step.title}>{step.title}</span>)}</div><button className="primary-btn small" onClick={()=>onStart(activity.id)}>Start guided activity</button></article>)}</div></section>)}</div>;
+  const quickActivities=ACTIVITY_LIBRARY.filter(activity=>activity.minutes<=4).slice(0,4);
+  return <div className="wellbeing-page"><section className="wellbeing-hero panel"><div><span className="section-label">WELLBEING</span><h2>Take a real break, not another tab.</h2><p>Short guided activities for calm, movement, recovery, and healthier screen routines. Every activity tells you exactly what to do.</p></div><div className="wellbeing-score"><strong>{todayPoints}</strong><span>points today</span><small>{todayRecords.length}/3 rewarded sessions</small></div></section><div className="wellbeing-daily panel"><div><span className="section-label">TODAY</span><h3>Your wellbeing rhythm</h3></div><div className="wellbeing-metrics"><div><strong>{todayRecords.length}</strong><span>completed</span></div><div><strong>{todayPoints}</strong><span>points</span></div><div><strong>{records.length}</strong><span>all-time sessions</span></div></div></div><section className="quick-wellbeing panel"><div className="quick-wellbeing-head"><div><span className="section-label">QUICK WELLBEING</span><h3>Busy day? Take a 3–4 minute reset.</h3><p>These shorter guided sessions are built for fast-paced days. They use the same full completion and reward rules as regular wellbeing activities.</p></div><span className="quick-wellbeing-badge">3–4 min</span></div><div className="quick-wellbeing-grid">{quickActivities.map(activity=><article className="quick-wellbeing-card" key={activity.id}><div className="activity-card-top"><span className="activity-duration">{activity.minutes} min</span><span className="activity-mark">{activity.category.slice(0,1)}</span></div><h4>{activity.title}</h4><p>{activity.summary}</p><button className="primary-btn small" onClick={()=>onStart(activity.id)}>Start quick reset</button></article>)}</div></section>{groups.map(group=><section className="wellbeing-group" key={group.category}><div className="wellbeing-group-head"><div><span className="section-label">{group.category}</span><h3>{group.category==='BREATHE'?'Mindfulness & breathing':group.category==='FLOW'?'Yoga & stretching':group.category==='ENERGISE'?'Light movement':group.category==='UNPLUG'?'Outdoor & social':'Small practical resets'}</h3></div><span className="mini-pill">{group.items.length} activities</span></div><div className="activity-grid">{group.items.map(activity=><article className="activity-card panel" key={activity.id}><div className="activity-card-top"><span className="activity-duration">{activity.minutes} min</span><span className="activity-mark">{activity.category.slice(0,1)}</span></div><h4>{activity.title}</h4><p>{activity.summary}</p><div className="activity-preview-steps">{activity.steps.slice(0,2).map(step=><span key={step.title}>{step.title}</span>)}</div><button className="primary-btn small" onClick={()=>onStart(activity.id)}>Start guided activity</button></article>)}</div></section>)}</div>;
 }
 
 function RewardsPage({data,rewards:catalog,filter,setFilter,search,setSearch,preview,onPreview,onBuy,onEquip,onApplyTheme,onResetPreview}:{data:TrackerData;rewards:Reward[];filter:'theme'|'frame'|'effect';setFilter:(v:'theme'|'frame'|'effect')=>void;search:string;setSearch:(v:string)=>void;preview:string|null;onPreview:(id:string)=>void;onBuy:(r:Reward)=>Promise<void>;onEquip:(r:Reward)=>Promise<void>;onApplyTheme:(id:string)=>Promise<void>;onResetPreview:()=>void}){
@@ -1432,16 +1543,504 @@ function RewardsPage({data,rewards:catalog,filter,setFilter,search,setSearch,pre
   </div>;
 }
 
-function Leaderboard({data,userId,refresh}:{data:LeaderboardRow[];userId:string;refresh:()=>Promise<void>}){const meIndex=data.findIndex(row=>row.user_id===userId);const me=meIndex>=0?data[meIndex]:undefined;const topThree=data.slice(0,3);const visibleRows=data.slice(0,25);if(me&&meIndex>=25)visibleRows.push(me);return <div className="leaderboard-v2"><section className="leaderboard-hero panel"><div><span className="section-label">LEADERBOARD</span><h2>Progress is better with people around you.</h2><p>Keep your focus, consistency, and healthy routines moving forward. Spending Balance Coins never lowers your rank.</p></div><div className="leaderboard-me"><span>Your rank</span><strong>{me?`#${data.findIndex(row=>row.user_id===userId)+1}`:'—'}</strong><small>{me?`${me.total_points.toLocaleString()} points`:'No rank yet'}</small></div></section><section className="leaderboard-podium panel"><div className="podium-grid">{topThree.map((row,index)=><div className={`podium-card place-${index+1}`} key={row.user_id}><span className="podium-place">{index+1}</span><div className="leader-avatar large">{row.display_name.slice(0,1).toUpperCase()}</div><strong>{row.display_name}</strong><small>{row.total_points.toLocaleString()} pts</small></div>)}</div></section><section className="panel leader-main-v2"><div className="panel-head"><div><span className="section-label">GLOBAL</span><h3>People building better habits</h3></div><button className="ghost-btn small" onClick={()=>void refresh()}>Refresh</button></div>{data.length?visibleRows.map((row,index)=><div className={`leader-row-v2 ${row.user_id===userId?'me':''}`} key={row.user_id}><span className="rank-badge">{String(data.findIndex(item=>item.user_id===row.user_id)+1).padStart(2,'0')}</span><div className="leader-avatar">{row.display_name.slice(0,1).toUpperCase()}</div><div className="leader-copy"><strong>{row.display_name}</strong><small>{row.user_id===userId?'You':'Liba Bilancia member'}</small></div><b>{row.total_points.toLocaleString()}</b></div>):<div className="empty">No leaderboard rows yet.</div>}</section></div>;}
+function ChallengesPage({data,streak}:{data:TrackerData;streak:number}){
+  const todayKey=new Date().toDateString();
+  const focusToday=data.focus_sessions.filter(item=>new Date(item.completed_at).toDateString()===todayKey);
+  const completedThirty=focusToday.filter(item=>item.minutes>=30).length;
+  const distinctDays=new Set(data.focus_sessions.map(item=>new Date(item.completed_at).toDateString()));
+  const dayCursor=new Date(); dayCursor.setHours(12,0,0,0);
+  let currentRun=0;
+  while(distinctDays.has(dayCursor.toDateString())){currentRun+=1;dayCursor.setDate(dayCursor.getDate()-1);}
+  const weekStart=new Date(); weekStart.setHours(0,0,0,0); const weekDay=weekStart.getDay(); weekStart.setDate(weekStart.getDate()+(weekDay===0?-6:1-weekDay));
+  const weekDays=new Set(data.focus_sessions.filter(item=>new Date(item.completed_at).getTime()>=weekStart.getTime()).map(item=>new Date(item.completed_at).toDateString())).size;
+  const challengeWeek=weekStart.toISOString().slice(0,10);
+  const weekChallengeKey=`liba-challenge-week-${challengeWeek}`;
+  const [claimed,setClaimed]=useState<Record<string,boolean>>(()=>{
+    try{return JSON.parse(localStorage.getItem('liba-bilancia-challenges')||'{}') as Record<string,boolean>;}catch{return {};}
+  });
+  const claim=(id:string,reward:number)=>{
+    if(claimed[id]) return;
+    const next={...claimed,[id]:true};
+    localStorage.setItem('liba-bilancia-challenges',JSON.stringify(next));
+    setClaimed(next);
+    setNoticeForChallenge(`Challenge complete — +${reward} Balance Coins.`);
+  };
+  const [message,setMessage]=useState('');
+  function setNoticeForChallenge(value:string){setMessage(value);window.setTimeout(()=>setMessage(current=>current===value?'':current),3200);}
+  const challenges=[
+    {id:'two-strong-sessions',eyebrow:'FOCUS',title:'Two strong sessions',detail:'Complete 2 Focus sessions of at least 30 minutes today.',progress:Math.min(2,completedThirty),goal:2,reward:80,icon:'⚡'},
+    {id:'streak-builder',eyebrow:'STREAK',title:'Keep the fire alive',detail:'Complete Focus sessions on 3 consecutive days.',progress:Math.min(3,Math.max(0,currentRun)),goal:3,reward:120,icon:'🔥'},
+    {id:weekChallengeKey,eyebrow:'WEEKLY',title:'Five-day week',detail:'Complete at least one Focus session on 5 different days this week.',progress:Math.min(5,weekDays),goal:5,reward:200,icon:'🏆'}
+  ];
+  return <div className="challenges-page">
+    <section className="challenge-hero panel"><div><span className="section-label">CHALLENGES</span><h2>Make the streak mean something.</h2><p>Challenges reward consistent Focus, not simply opening the app. Focus sessions with controls active are what build your streak.</p></div><div className="streak-hero"><span>Current streak</span><strong>🔥 {streak}</strong><small>{streak===0?'Complete a Focus session today to begin.':streak===1?'One day down. Come back tomorrow.':'Keep the run alive.'}</small></div></section>
+    <section className="challenge-rules panel"><div className="challenge-rule"><strong>1</strong><span><b>Focus counts.</b> A completed Focus session creates the day's streak entry.</span></div><div className="challenge-rule"><strong>2</strong><span><b>Controls matter.</b> The session starts protection through the existing Focus control system.</span></div><div className="challenge-rule"><strong>3</strong><span><b>Don't farm it.</b> Each challenge can be claimed once for its current period.</span></div></section>
+    <section className="challenge-grid">{challenges.map(challenge=>{const done=challenge.progress>=challenge.goal;const wasClaimed=Boolean(claimed[challenge.id]);return <article className={`challenge-card panel ${done?'complete':''}`} key={challenge.id}><div className="challenge-card-top"><span className="challenge-icon">{challenge.icon}</span><span className="challenge-eyebrow">{challenge.eyebrow}</span><span className={`challenge-state ${done?'ready':''}`}>{done?(wasClaimed?'Claimed':'Ready'):`${challenge.progress}/${challenge.goal}`}</span></div><h3>{challenge.title}</h3><p>{challenge.detail}</p><div className="challenge-progress"><span style={{width:`${Math.min(100,(challenge.progress/challenge.goal)*100)}%`}}/></div><div className="challenge-bottom"><strong>+{challenge.reward} coins</strong>{done&&!wasClaimed?<button className="primary-btn small" onClick={()=>claim(challenge.id,challenge.reward)}>Claim reward</button>:<small>{wasClaimed?'Reward claimed for this period':done?'Complete':'Keep going'}</small>}</div></article>})}</section>
+    {message&&<button className="notice challenge-notice" onClick={()=>setMessage('')}><span>{message}</span><span>×</span></button>}
+    <section className="challenge-note panel"><span>💡</span><div><strong>Streak rewards get better later.</strong><p>We’ll use higher streak milestones to unlock stronger coin bonuses and exclusive cosmetics, while leaderboard points continue to come from verified Focus progress.</p></div></section>
+  </div>;
+}
 
-function SettingsPage({data,setData,user,appearance,onAppearanceChange,onSaveDisplayName,onCheckForUpdates,updateCheckBusy}:{data:TrackerData;setData:(data:TrackerData)=>void;user:User|null;appearance:AppearancePreference;onAppearanceChange:(value:AppearancePreference)=>void;onSaveDisplayName:(name:string)=>Promise<void>;onCheckForUpdates:()=>Promise<void>;updateCheckBusy:boolean}){
+const SEASON_ONE_END = new Date('2026-12-28T23:59:59');
+function SeasonPage({progress,loading,error,online,claiming,onRefresh,onClaim}:{progress:{points:number;rewardClaimed:boolean};loading:boolean;error:string;online:boolean;claiming:boolean;onRefresh:()=>Promise<void>;onClaim:()=>Promise<void>}){
+  const goal=5000;
+  const points=Math.max(0,progress.points);
+  const percent=Math.min(100,Math.round(points/goal*100));
+  const daysLeft=Math.max(0,Math.ceil((SEASON_ONE_END.getTime()-Date.now())/(1000*60*60*24)));
+  const milestones=[
+    {points:1000,label:'First signal',copy:'Your season is underway.',icon:'✦'},
+    {points:2500,label:'Steady momentum',copy:'Halfway to the cache.',icon:'⚡'},
+    {points:4000,label:'Almost there',copy:'The final signal is close.',icon:'◈'},
+    {points:5000,label:'The First Light cache',copy:'A season finale reward is ready.',icon:'✧'},
+  ];
+  return <div className="season-page">
+    <section className="season-hero panel">
+      <div className="season-hero-copy">
+        <span className="section-label">LIBA BILANCIA · SEASON 01</span>
+        <div className="season-kicker">A NEW SIGNAL HAS ARRIVED</div>
+        <h2>FIRST LIGHT</h2>
+        <p>Build your season score through verified Focus sessions and earned activity rewards. Every point moves the signal forward.</p>
+        <div className="season-dates"><span>28 NOV 2026</span><i/> <span>28 DEC 2026</span><b>{daysLeft} days left</b></div>
+      </div>
+      <div className="season-emblem" aria-hidden="true"><span>✦</span><i/><b>01</b></div>
+    </section>
+
+    <section className="season-progress-card panel">
+      <div className="season-progress-head">
+        <div><span className="section-label">YOUR SEASON SCORE</span><h3>{points.toLocaleString()} <span>/ {goal.toLocaleString()} points</span></h3></div>
+        <strong className="season-percent">{percent}%</strong>
+      </div>
+      <div className="season-track" role="progressbar" aria-label="Season progress" aria-valuemin={0} aria-valuemax={goal} aria-valuenow={Math.min(goal,points)}><span style={{width:`${percent}%`}}/></div>
+      <div className="season-progress-foot"><span>{Math.max(0,goal-points).toLocaleString()} points to the finale</span><button className="text-btn" onClick={()=>void onRefresh()} disabled={loading}>{loading?'Refreshing…':'Refresh progress'}</button></div>
+      {!online&&<p className="season-offline-note">Connect to the internet to sync Season Points. Offline sessions remain local until the normal cloud reward flow runs.</p>}
+      {error&&<p className="season-error-note">Season data could not load: {error}. Make sure the Season 01 SQL setup has been run in Supabase.</p>}
+    </section>
+
+    <section className="season-milestones panel">
+      <div className="panel-head"><div><span className="section-label">THE PATH</span><h3>Season milestones</h3></div><span className="mini-pill">4 milestones</span></div>
+      <div className="season-milestone-list">{milestones.map((milestone)=>{const reached=points>=milestone.points;return <div className={`season-milestone ${reached?'reached':''}`} key={milestone.points}><span className="season-milestone-icon">{reached?'✓':milestone.icon}</span><div className="season-milestone-copy"><strong>{milestone.label}</strong><small>{milestone.copy}</small></div><b>{milestone.points.toLocaleString()}</b></div>})}</div>
+    </section>
+
+    <section className={`season-cache panel ${points>=goal?'unlocked':''} ${progress.rewardClaimed?'claimed':''}`}>
+      <div className="season-cache-seal" aria-hidden="true">{progress.rewardClaimed?'✓':points>=goal?'✦':'?'}</div>
+      <div className="season-cache-copy">
+        <span className="section-label">{progress.rewardClaimed?'CACHE OPENED':points>=goal?'SIGNAL DECODED':'SEALED TRANSMISSION'}</span>
+        <h3>{progress.rewardClaimed?'The First Light cache is yours.':points>=goal?'The signal is ready.':'Something is waiting at 5,000.'}</h3>
+        <p>{progress.rewardClaimed?'You have claimed the Season 01 finale reward on this account.':points>=goal?'You reached the season goal. Open the cache to reveal your reward.':'Keep earning verified points. The contents stay hidden until the season goal is reached.'}</p>
+        {points>=goal&&!progress.rewardClaimed&&<button className="primary-btn season-reveal-btn" onClick={()=>void onClaim()} disabled={claiming}>{claiming?'Opening cache…':'Reveal season reward'}</button>}
+        {progress.rewardClaimed&&<div className="season-reward-revealed"><strong>+1,000 Balance Coins</strong><span>FIRST LIGHT · SEASON 01</span></div>}
+      </div>
+      <div className="season-cache-side"><span>FINALE REWARD</span><strong>{progress.rewardClaimed?'REVEALED':points>=goal?'READY':'???'}</strong><small>{progress.rewardClaimed?'Added to your Balance Coins':points>=goal?'Your signal has been decoded':'Locked until 5,000 points'}</small></div>
+    </section>
+
+    <section className="season-footnote"><span>✦</span><p>Only points actually awarded by Liba Bilancia count. Balance Coins, purchases and journal activity do not increase your Season Score.</p></section>
+  </div>;
+}
+
+type AvatarLeaderboardRow = LeaderboardRow & { avatar_url?: string | null };
+function AvatarImage({url,name,className}:{url?:string|null;name:string;className:string}){return <div className={className}>{url?<img src={url} alt=""/>:name.slice(0,1).toUpperCase()}</div>;}
+function Leaderboard({data,userId,refresh}:{data:LeaderboardRow[];userId:string;refresh:()=>Promise<void>}){const rows=data as AvatarLeaderboardRow[];const meIndex=rows.findIndex(row=>row.user_id===userId);const me=meIndex>=0?rows[meIndex]:undefined;const topThree=rows.slice(0,3);const visibleRows=rows.slice(0,25);if(me&&meIndex>=25)visibleRows.push(me);return <div className="leaderboard-v2"><section className="leaderboard-hero panel"><div><span className="section-label">LEADERBOARD</span><h2>Progress is better with people around you.</h2><p>Keep your focus, consistency, and healthy routines moving forward. Spending Balance Coins never lowers your rank.</p></div><div className="leaderboard-me"><span>Your rank</span><strong>{me?`#${rows.findIndex(row=>row.user_id===userId)+1}`:'—'}</strong><small>{me?`${me.total_points.toLocaleString()} points`:'No rank yet'}</small></div></section><section className="leaderboard-podium panel"><div className="podium-grid">{topThree.map((row,index)=><div className={`podium-card place-${index+1}`} key={row.user_id}><span className={`podium-medal medal-${index+1}`} aria-label={`${index+1 === 1 ? 'Gold' : index+1 === 2 ? 'Silver' : 'Bronze'} medal`}>{index===0?'🥇':index===1?'🥈':'🥉'}</span><span className="podium-place">#{index+1}</span><AvatarImage url={row.avatar_url} name={row.display_name} className="leader-avatar large"/><strong>{row.display_name}</strong><small>{row.total_points.toLocaleString()} pts</small></div>)}</div></section><section className="panel leader-main-v2"><div className="panel-head"><div><span className="section-label">GLOBAL</span><h3>People building better habits</h3></div><button className="ghost-btn small" onClick={()=>void refresh()}>Refresh</button></div>{rows.length?visibleRows.map(row=><div className={`leader-row-v2 ${row.user_id===userId?'me':''}`} key={row.user_id}><span className="rank-badge">{String(rows.findIndex(item=>item.user_id===row.user_id)+1).padStart(2,'0')}</span><AvatarImage url={row.avatar_url} name={row.display_name} className="leader-avatar"/><div className="leader-copy"><strong>{row.display_name}</strong><small>{row.user_id===userId?'You':'Liba Bilancia member'}</small></div><b>{row.total_points.toLocaleString()}</b></div>):<div className="empty">No leaderboard rows yet.</div>}</section></div>;}
+
+function AvatarPicker({user,currentUrl,onSaved}:{user:User|null;currentUrl:string;onSaved:(url:string)=>void}){
+  const [open,setOpen]=useState(false);
+  const [cameraActive,setCameraActive]=useState(false);
+  const [busy,setBusy]=useState(false);
+  const [error,setError]=useState('');
+  const fileRef=useRef<HTMLInputElement|null>(null);
+  const videoRef=useRef<HTMLVideoElement|null>(null);
+  const streamRef=useRef<MediaStream|null>(null);
+
+  const stopCamera=()=>{streamRef.current?.getTracks().forEach(track=>track.stop());streamRef.current=null;if(videoRef.current)videoRef.current.srcObject=null;setCameraActive(false);};
+  useEffect(()=>()=>stopCamera(),[]);
+
+  const normalizeAvatar=async(source:Blob)=>{
+    const bitmap=await createImageBitmap(source);
+    const size=Math.min(bitmap.width,bitmap.height);
+    const sx=(bitmap.width-size)/2;const sy=(bitmap.height-size)/2;
+    const canvas=document.createElement('canvas');canvas.width=512;canvas.height=512;
+    const ctx=canvas.getContext('2d');if(!ctx){bitmap.close();throw new Error('Could not prepare that image.');}
+    ctx.drawImage(bitmap,sx,sy,size,size,0,0,512,512);bitmap.close();
+    const result=await new Promise<Blob>((resolve,reject)=>canvas.toBlob(blob=>blob?resolve(blob):reject(new Error('Could not encode that image.')),'image/webp',0.88));
+    return result;
+  };
+
+  const saveBlob=async(blob:Blob)=>{
+    if(!user||!supabase)throw new Error('Sign in to set a profile picture.');
+    setBusy(true);setError('');
+    try{const optimized=await normalizeAvatar(blob);const url=await uploadProfileAvatar(optimized);if(!url)throw new Error('The picture was saved, but a preview URL could not be created.');onSaved(url);setOpen(false);stopCamera();}
+    catch(err){setError(err instanceof Error?err.message:'Could not save that picture.');}
+    finally{setBusy(false);}
+  };
+
+  const chooseDevice=()=>fileRef.current?.click();
+  const handleFile=(file:File|null)=>{if(!file)return;if(!file.type.startsWith('image/')){setError('Choose an image file.');return;}if(file.size>10*1024*1024){setError('Choose an image under 10 MB.');return;}void saveBlob(file);};
+  const startCamera=async()=>{setError('');try{const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'},audio:false});streamRef.current=stream;setCameraActive(true);if(videoRef.current){videoRef.current.srcObject=stream;await videoRef.current.play();}}catch(err){setError(err instanceof Error?err.message:'Camera access was blocked. Check Windows camera permissions and try again.');}};
+  const takePhoto=async()=>{const video=videoRef.current;if(!video||video.readyState<2)return;const canvas=document.createElement('canvas');canvas.width=video.videoWidth||640;canvas.height=video.videoHeight||480;const ctx=canvas.getContext('2d');if(!ctx)return;ctx.translate(canvas.width,0);ctx.scale(-1,1);ctx.drawImage(video,0,0,canvas.width,canvas.height);const blob=await new Promise<Blob|null>(resolve=>canvas.toBlob(resolve,'image/jpeg',0.92));if(blob)await saveBlob(blob);};
+  const remove=async()=>{setBusy(true);setError('');try{await removeProfileAvatar();onSaved('');setOpen(false);stopCamera();}catch(err){setError(err instanceof Error?err.message:'Could not remove the profile picture.');}finally{setBusy(false);}};
+
+  return <>{<div className="profile-picture-panel"><div className="profile-picture-preview">{currentUrl?<img src={currentUrl} alt="Profile"/>:user?.email?.slice(0,1).toUpperCase()||'L'}</div><div className="profile-picture-copy"><strong>Profile picture</strong><p>Use a picture from this device or take a selfie with your webcam. Your avatar is shown to signed-in members on the leaderboard.</p><div className="profile-picture-actions"><button type="button" className="primary-btn" onClick={()=>{setError('');setOpen(true)}}>Change picture</button>{currentUrl&&<button type="button" className="ghost-btn" onClick={()=>{setError('');void remove()}} disabled={busy}>Remove</button>}</div></div></div>}
+  <input ref={fileRef} type="file" accept="image/*" hidden onChange={e=>{handleFile(e.target.files?.[0]??null);e.currentTarget.value='';}}/>
+  {open&&<div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="avatar-picker-title"><div className="avatar-picker-modal"><div className="panel-head"><div><span className="section-label">PROFILE PICTURE</span><h3 id="avatar-picker-title">Choose your picture</h3></div><button className="close-dialog-dismiss" onClick={()=>{setOpen(false);stopCamera();}} aria-label="Close">×</button></div><p className="avatar-picker-note">Pick a device image or use your webcam. Liba Bilancia crops it to a clean square and stores it in your private profile-picture area.</p>{!cameraActive?<div className="avatar-choice-grid"><button type="button" className="avatar-choice-card" onClick={chooseDevice}><span>🖼️</span><strong>Choose from device</strong><small>PNG, JPG, WEBP and other image files.</small></button><button type="button" className="avatar-choice-card" onClick={()=>void startCamera()}><span>📷</span><strong>Use webcam</strong><small>Take a fresh selfie inside Liba Bilancia.</small></button></div>:<div className="camera-box"><video ref={videoRef} autoPlay muted playsInline/><div className="camera-actions"><button type="button" className="primary-btn" onClick={()=>void takePhoto()} disabled={busy}>Take photo</button><button type="button" className="ghost-btn" onClick={stopCamera} disabled={busy}>Back</button></div></div>}{error&&<div className="login-error avatar-error">{error}</div>}{busy&&<div className="avatar-uploading">Saving profile picture…</div>}</div></div>}
+</>;
+}
+
+function FeedbackHub({user}:{user:User|null}){
+  const [category,setCategory]=useState<'bug'|'concern'|'suggestion'|'general'>('suggestion');
+  const [message,setMessage]=useState('');
+  const [busy,setBusy]=useState(false);
+  const [result,setResult]=useState<string|null>(null);
+  const maxLength=2000;
+  async function submit(){
+    const clean=message.trim();
+    setResult(null);
+    if(!user){setResult('Sign in to send feedback.');return;}
+    if(clean.length<5){setResult('Please write a little more so the feedback is useful.');return;}
+    setBusy(true);
+    try{
+      await submitFeedback(category,clean);
+      setMessage('');
+      setResult('Thanks — your feedback was sent successfully.');
+    }catch(error){
+      console.error(error);
+      setResult(error instanceof Error?error.message:'Could not send feedback right now.');
+    }finally{setBusy(false);}
+  }
+  return <section className="panel full-width feedback-panel">
+    <div className="panel-head">
+      <div>
+        <span className="section-label">FEEDBACK HUB</span>
+        <h3>Help shape Liba Bilancia</h3>
+      </div>
+      <span className="mini-pill">Private channel</span>
+    </div>
+    <p className="muted-copy feedback-intro">Found a bug, have a concern, or have an idea that would make Liba Bilancia better? Send it here. Your message is linked to your signed-in account so it can be followed up without putting an email password inside the app.</p>
+    <div className="feedback-grid">
+      <label className="field">
+        <span>Feedback type</span>
+        <select value={category} onChange={e=>setCategory(e.target.value as typeof category)}>
+          <option value="suggestion">Suggestion</option>
+          <option value="bug">Bug report</option>
+          <option value="concern">Concern</option>
+          <option value="general">General feedback</option>
+        </select>
+      </label>
+      <div className="feedback-account">
+        <span className="section-label">SIGNED-IN ACCOUNT</span>
+        <strong>{user?.email||'Not signed in'}</strong>
+        <small>Used only so feedback can be tied to your account.</small>
+      </div>
+    </div>
+    <label className="field feedback-message-field">
+      <span>Your message</span>
+      <textarea
+        value={message}
+        onChange={e=>setMessage(e.target.value.slice(0,maxLength))}
+        maxLength={maxLength}
+        rows={6}
+        placeholder="Tell us what happened, what you would change, or what you would love to see next…"
+      />
+    </label>
+    <div className="feedback-footer">
+      <span className="feedback-counter">{message.length.toLocaleString()} / {maxLength}</span>
+      <button type="button" className="primary-btn" onClick={()=>void submit()} disabled={busy||!user||message.trim().length<5}>{busy?'Sending…':'Send feedback'}</button>
+    </div>
+    {result&&<div className={`feedback-result ${result.startsWith('Thanks')?'success':'error'}`}>{result}</div>}
+  </section>;
+}
+
+function SettingsPage({data,setData,user,appearance,onAppearanceChange,onSaveDisplayName,onCheckForUpdates,updateCheckBusy,profileAvatarUrl,onAvatarSaved}:{data:TrackerData;setData:(data:TrackerData)=>void;user:User|null;appearance:AppearancePreference;onAppearanceChange:(value:AppearancePreference)=>void;onSaveDisplayName:(name:string)=>Promise<void>;onCheckForUpdates:()=>Promise<void>;updateCheckBusy:boolean;profileAvatarUrl:string;onAvatarSaved:(url:string)=>void}){
   const [busy,setBusy]=useState(false); const [name,setName]=useState(data.settings.displayName||user?.user_metadata?.name||user?.email?.split('@')[0]||'Liba Bilancia');
+  const [appVersion,setAppVersion]=useState('—');
+  useEffect(()=>{let alive=true;void getVersion().then(version=>{if(alive)setAppVersion(version)}).catch(()=>{});return()=>{alive=false}},[]);
   useEffect(()=>{setName(data.settings.displayName||user?.user_metadata?.name||user?.email?.split('@')[0]||'Liba Bilancia');},[data.settings.displayName]);
   async function update(patch:Partial<AppSettings>){setBusy(true);try{setData(await saveSettings({...data.settings,...patch}));}finally{setBusy(false);}}
   const knownApps=[...new Set(data.sessions.map(s=>s.exe))].filter(isProtectedCandidate).sort().slice(0,40);
-  return <div className="settings-grid"><section className="panel appearance-panel"><div className="panel-head"><div><span className="section-label">Appearance</span><h3>Choose your workspace look</h3></div></div><p className="muted-copy">Pick a light or dark workspace, or let Liba Bilancia follow your Windows appearance.</p><div className="appearance-options" role="group" aria-label="App appearance">{([['light','Light'],['dark','Dark'],['system','System']] as [AppearancePreference,string][]).map(([value,label])=><button type="button" key={value} className={appearance===value?'selected':''} aria-pressed={appearance===value} onClick={()=>onAppearanceChange(value)}><span className={`appearance-swatch ${value}`}/><strong>{label}</strong><small>{value==='system'?'Follow Windows':value==='light'?'Bright surfaces':'Low-light surfaces'}</small></button>)}</div><p className="appearance-note">Reward themes still change accent colours and typography. Your appearance choice always controls the background and panels, so rewards will not force dark mode.</p></section><section className="panel"><div className="panel-head"><div><span className="section-label">Identity</span><h3>Make the profile yours</h3></div></div><label className="field"><span>Display name</span><input maxLength={28} value={name} onChange={e=>setName(e.target.value)}/></label><div className="name-actions"><button className="primary-btn" onClick={()=>void onSaveDisplayName(name)}>Save name</button><button className="ghost-btn" onClick={()=>{const n=randomName();setName(n);void onSaveDisplayName(n)}}>Random name</button></div><div className="preset-names">{AESTHETIC_NAMES.slice(0,8).map(n=><button key={n} onClick={()=>{setName(n);void onSaveDisplayName(n)}}>{n}</button>)}</div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Behavior</span><h3>Daily rules</h3></div>{busy&&<span className="mini-pill">Saving…</span>}</div><label className="field"><span>Distraction limit (minutes)</span><input type="number" min="1" value={data.settings.dailyDistractionLimitMinutes} onChange={e=>void update({dailyDistractionLimitMinutes:Math.max(1,Math.floor(Number(e.target.value)||1))})}/></label><label className="field"><span>Focus target (minutes)</span><input type="number" min="1" value={data.settings.dailyFocusTargetMinutes} onChange={e=>void update({dailyFocusTargetMinutes:Math.max(1,Math.floor(Number(e.target.value)||1))})}/></label><label className="field"><span>Idle threshold (seconds)</span><input type="number" min="15" value={data.settings.idleThresholdSeconds} onChange={e=>void update({idleThresholdSeconds:Math.max(15,Math.floor(Number(e.target.value)||15))})}/></label><div className="setting-toggle"><div><strong>Notifications</strong><small>Allow Liba Bilancia nudges.</small></div><button className={`toggle ${data.settings.notificationsEnabled?'on':''}`} onClick={()=>void update({notificationsEnabled:!data.settings.notificationsEnabled})}><span/></button></div><div className="setting-toggle"><div><strong>Motivational nudges</strong><small>Occasional firm reminders when distraction runs long.</small></div><button className={`toggle ${data.settings.motivationalNudges?'on':''}`} onClick={()=>void update({motivationalNudges:!data.settings.motivationalNudges})}><span/></button></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Windows</span><h3>Integration</h3></div></div><div className="setting-toggle"><div><strong>Start with Windows</strong><small>Launch the tracker when you sign in.</small></div><button className={`toggle ${data.settings.autostartEnabled?'on':''}`} onClick={()=>void update({autostartEnabled:!data.settings.autostartEnabled})}><span/></button></div><div className="setting-toggle"><div><strong>Ask before closing</strong><small>Offer to keep Liba Bilancia running quietly in the tray.</small></div><button className={`toggle ${data.settings.closeToTray?'on':''}`} onClick={()=>void update({closeToTray:!data.settings.closeToTray})}><span/></button></div><div className="setting-toggle"><div><strong>Deep Focus auto-block</strong><small>Enforce your Focus blocklist when Deep Focus starts.</small></div><button className={`toggle ${data.settings.deepFocusAutoBlock?'on':''}`} onClick={()=>void update({deepFocusAutoBlock:!data.settings.deepFocusAutoBlock})}><span/></button></div><div className="setting-toggle"><div><strong>Updates</strong><small>Check GitHub for a newer Liba Bilancia release.</small></div><button className="ghost-btn" onClick={()=>void onCheckForUpdates()} disabled={updateCheckBusy}>{updateCheckBusy?'Checking…':'Check for updates'}</button></div><button className="danger-btn" onClick={async()=>{if(window.confirm('Delete all local Liba Bilancia activity?'))setData(await deleteLocalData())}}>Delete local activity</button><button className="ghost-btn full" onClick={async()=>{await navigator.clipboard.writeText(await exportLocalData())}}>Copy privacy export JSON</button></section><section className="panel full-width"><div className="panel-head"><div><span className="section-label">Categories</span><h3>Teach Liba Bilancia your apps</h3></div><small>Liba Bilancia and Windows system processes are excluded.</small></div>{knownApps.length?knownApps.map(exe=>{const current=data.settings.categoryOverrides[exe]??data.sessions.find(s=>s.exe===exe)?.category??'Neutral';return <div className="category-row" key={exe}><span>{friendlyAppName(exe,exe)}</span><SmartSelect value={current} onChange={v=>void saveCategory(exe,v).then(setData)} options={categories.map(c=>({value:c,label:c}))} ariaLabel={`Category for ${friendlyAppName(exe,exe)}`}/></div>}):<div className="empty">Use the computer for a bit and app categories will appear here.</div>}</section></div>;}
+  return <div className="settings-grid"><section className="panel appearance-panel"><div className="panel-head"><div><span className="section-label">Appearance</span><h3>Choose your workspace look</h3></div></div><p className="muted-copy">Pick a light or dark workspace, or let Liba Bilancia follow your Windows appearance.</p><div className="appearance-options" role="group" aria-label="App appearance">{([['light','Light'],['dark','Dark'],['system','System']] as [AppearancePreference,string][]).map(([value,label])=><button type="button" key={value} className={appearance===value?'selected':''} aria-pressed={appearance===value} onClick={()=>onAppearanceChange(value)}><span className={`appearance-swatch ${value}`}/><strong>{label}</strong><small>{value==='system'?'Follow Windows':value==='light'?'Bright surfaces':'Low-light surfaces'}</small></button>)}</div><p className="appearance-note">Reward themes still change accent colours and typography. Your appearance choice always controls the background and panels, so rewards will not force dark mode.</p></section><section className="panel identity-panel"><div className="panel-head"><div><span className="section-label">Identity</span><h3>Make the profile yours</h3></div></div><div className="identity-picture-wrap"><AvatarPicker user={user} currentUrl={profileAvatarUrl} onSaved={onAvatarSaved}/></div><label className="field"><span>Display name</span><input maxLength={28} value={name} onChange={e=>setName(e.target.value)}/></label><div className="name-actions"><button className="primary-btn" onClick={()=>void onSaveDisplayName(name)}>Save name</button><button className="ghost-btn" onClick={()=>{const n=randomName();setName(n);void onSaveDisplayName(n)}}>Random name</button></div><div className="preset-names">{AESTHETIC_NAMES.slice(0,8).map(n=><button key={n} onClick={()=>{setName(n);void onSaveDisplayName(n)}}>{n}</button>)}</div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Behavior</span><h3>Daily rules</h3></div>{busy&&<span className="mini-pill">Saving…</span>}</div><label className="field"><span>Distraction limit (minutes)</span><input type="number" min="1" value={data.settings.dailyDistractionLimitMinutes} onChange={e=>void update({dailyDistractionLimitMinutes:Math.max(1,Math.floor(Number(e.target.value)||1))})}/></label><div className="daily-target-settings-block"><div className="daily-target-settings-copy"><span className="section-label">DAILY TARGET</span><h4>How much Focus do you want today?</h4><p>Choose a target that is challenging but realistic. Reaching it can earn your daily progress reward.</p></div><div className="daily-target-presets">{DAILY_TARGET_PRESETS.map(value=><button type="button" key={value} className={data.settings.dailyFocusTargetMinutes===value?'selected':''} onClick={()=>void update({dailyFocusTargetMinutes:value})}>{value<60?`${value}m`:`${value/60}h`}</button>)}</div><label className="field"><span>Custom target (minutes)</span><input type="number" min="5" max="600" step="5" value={data.settings.dailyFocusTargetMinutes} onChange={e=>void update({dailyFocusTargetMinutes:Math.min(600,Math.max(5,Math.floor(Number(e.target.value)||5)))})}/></label></div><label className="field"><span>Idle threshold (seconds)</span><input type="number" min="15" value={data.settings.idleThresholdSeconds} onChange={e=>void update({idleThresholdSeconds:Math.max(15,Math.floor(Number(e.target.value)||15))})}/></label><div className="setting-toggle"><div><strong>Notifications</strong><small>Allow Liba Bilancia nudges.</small></div><button className={`toggle ${data.settings.notificationsEnabled?'on':''}`} onClick={()=>void update({notificationsEnabled:!data.settings.notificationsEnabled})}><span/></button></div><div className="setting-toggle"><div><strong>Motivational nudges</strong><small>Occasional firm reminders when distraction runs long.</small></div><button className={`toggle ${data.settings.motivationalNudges?'on':''}`} onClick={()=>void update({motivationalNudges:!data.settings.motivationalNudges})}><span/></button></div></section><section className="panel"><div className="panel-head"><div><span className="section-label">Windows</span><h3>Integration</h3></div></div><div className="setting-toggle"><div><strong>Start with Windows</strong><small>Launch the tracker when you sign in.</small></div><button className={`toggle ${data.settings.autostartEnabled?'on':''}`} onClick={()=>void update({autostartEnabled:!data.settings.autostartEnabled})}><span/></button></div><div className="setting-toggle"><div><strong>Ask before closing</strong><small>Offer to keep Liba Bilancia running quietly in the tray.</small></div><button className={`toggle ${data.settings.closeToTray?'on':''}`} onClick={()=>void update({closeToTray:!data.settings.closeToTray})}><span/></button></div><div className="setting-toggle"><div><strong>Deep Focus auto-block</strong><small>Enforce your Focus blocklist when Deep Focus starts.</small></div><button className={`toggle ${data.settings.deepFocusAutoBlock?'on':''}`} onClick={()=>void update({deepFocusAutoBlock:!data.settings.deepFocusAutoBlock})}><span/></button></div><div className="setting-toggle version-row"><div><strong>Current version</strong><small>Liba Bilancia installed on this device.</small></div><span className="version-badge">v{appVersion}</span></div><div className="setting-toggle updates-row"><div><strong>Updates</strong><small>Check GitHub for a newer Liba Bilancia release.</small></div><button className="ghost-btn" onClick={()=>void onCheckForUpdates()} disabled={updateCheckBusy}>{updateCheckBusy?'Checking…':'Check for updates'}</button></div><button className="danger-btn" onClick={async()=>{if(window.confirm('Delete all local Liba Bilancia activity?'))setData(await deleteLocalData())}}>Delete local activity</button><button className="ghost-btn full" onClick={async()=>{await navigator.clipboard.writeText(await exportLocalData())}}>Copy privacy export JSON</button></section><section className="panel full-width"><div className="panel-head"><div><span className="section-label">Categories</span><h3>Teach Liba Bilancia your apps</h3></div><small>Liba Bilancia and Windows system processes are excluded.</small></div>{knownApps.length?knownApps.map(exe=>{const current=data.settings.categoryOverrides[exe]??data.sessions.find(s=>s.exe===exe)?.category??'Neutral';return <div className="category-row" key={exe}><span>{friendlyAppName(exe,exe)}</span><SmartSelect value={current} onChange={v=>void saveCategory(exe,v).then(setData)} options={categories.map(c=>({value:c,label:c}))} ariaLabel={`Category for ${friendlyAppName(exe,exe)}`}/></div>}):<div className="empty">Use the computer for a bit and app categories will appear here.</div>}</section><FeedbackHub user={user}/></div>;}
 
-function CommandPalette({onClose,onGo,onStartFocus}:{onClose:()=>void;onGo:(v:View)=>void;onStartFocus:()=>void}){const actions:[string,View|'focus'][]=[['Open Overview','Overview'],['Open Focus','Focus'],['Open Insights','Insights'],['Open Control Center','Control'],['Open Wellbeing','Wellbeing'],['Open Rewards','Rewards'],['Open Leaderboard','Leaderboard'],['Open Settings','Settings'],['Start Focus now','focus']];return <div className="palette-backdrop" onClick={onClose}><div className="palette" onClick={e=>e.stopPropagation()}><div className="palette-input"><span>⌕</span><input autoFocus placeholder="Jump to a feature…"/></div>{actions.map(([label,target])=><button key={label} onClick={()=>target==='focus'?onStartFocus():onGo(target)}><span>{label}</span><kbd>↵</kbd></button>)}</div></div>;}
+
+
+type JournalMood = 'Reflecting' | 'Grateful' | 'Focused' | 'Stressed' | 'Hopeful' | 'Other';
+type JournalEntry = {
+  id: string;
+  title: string;
+  body: string;
+  mood: JournalMood;
+  createdAt: string;
+  updatedAt: string;
+};
+type JournalEnvelope = {
+  version: 1;
+  algorithm: 'PBKDF2-SHA256+A256GCM';
+  iterations: number;
+  salt: string;
+  iv: string;
+  ciphertext: string;
+  updatedAt: string;
+};
+type JournalLoadResult = { vault: JournalEnvelope | null; invalid: boolean };
+
+const JOURNAL_KDF_ITERATIONS = 310000;
+
+function readJournalEnvelope(storageKey: string): JournalLoadResult {
+  try {
+    const raw = localStorage.getItem(storageKey);
+    if (!raw) return { vault: null, invalid: false };
+    const value = JSON.parse(raw) as Partial<JournalEnvelope>;
+    if (value.version !== 1 || value.algorithm !== 'PBKDF2-SHA256+A256GCM' ||
+        typeof value.salt !== 'string' || typeof value.iv !== 'string' ||
+        typeof value.ciphertext !== 'string' || typeof value.iterations !== 'number') {
+      return { vault: null, invalid: true };
+    }
+    return { vault: value as JournalEnvelope, invalid: false };
+  } catch {
+    return { vault: null, invalid: true };
+  }
+}
+
+function journalBytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function journalBase64ToBytes(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function deriveJournalKey(passphrase: string, salt: Uint8Array, iterations: number): Promise<CryptoKey> {
+  if (!globalThis.crypto?.subtle) throw new Error('This device does not support the secure encryption needed by Journal.');
+  const material = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(passphrase) as unknown as BufferSource,
+    'PBKDF2',
+    false,
+    ['deriveKey'],
+  );
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: salt as unknown as BufferSource, iterations, hash: 'SHA-256' },
+    material,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+}
+
+async function encryptJournalEntries(entries: JournalEntry[], key: CryptoKey, salt: Uint8Array, iterations: number): Promise<JournalEnvelope> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(JSON.stringify(entries));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: iv as unknown as BufferSource },
+    key,
+    plaintext as unknown as BufferSource,
+  );
+  return {
+    version: 1,
+    algorithm: 'PBKDF2-SHA256+A256GCM',
+    iterations,
+    salt: journalBytesToBase64(salt),
+    iv: journalBytesToBase64(iv),
+    ciphertext: journalBytesToBase64(new Uint8Array(ciphertext)),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function decryptJournalEntries(vault: JournalEnvelope, key: CryptoKey): Promise<JournalEntry[]> {
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: journalBase64ToBytes(vault.iv) as unknown as BufferSource },
+    key,
+    journalBase64ToBytes(vault.ciphertext) as unknown as BufferSource,
+  );
+  const value = JSON.parse(new TextDecoder().decode(plaintext)) as unknown;
+  if (!Array.isArray(value)) throw new Error('The saved journal format is invalid.');
+  return value as JournalEntry[];
+}
+
+function JournalPage({ userId }: { userId: string }) {
+  const storageKey = `liba-bilancia-journal-v1:${userId}`;
+  const [initialLoad] = useState<JournalLoadResult>(() => readJournalEnvelope(storageKey));
+  const [vault, setVault] = useState<JournalEnvelope | null>(initialLoad.vault);
+  const [vaultLoadError, setVaultLoadError] = useState(initialLoad.invalid ? 'The saved journal file could not be read. You can keep the data and try again, or delete this local vault to start fresh.' : '');
+  const [journalKey, setJournalKey] = useState<CryptoKey | null>(null);
+  const [unlocked, setUnlocked] = useState(false);
+  const [entries, setEntries] = useState<JournalEntry[]>([]);
+  const [passphrase, setPassphrase] = useState('');
+  const [confirmPassphrase, setConfirmPassphrase] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [search, setSearch] = useState('');
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [draftTitle, setDraftTitle] = useState('');
+  const [draftBody, setDraftBody] = useState('');
+  const [draftMood, setDraftMood] = useState<JournalMood>('Reflecting');
+
+  const visibleEntries = entries
+    .slice()
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .filter(entry => !search.trim() || `${entry.title} ${entry.body} ${entry.mood}`.toLowerCase().includes(search.toLowerCase()));
+  const selectedEntry = editingId ? entries.find(entry => entry.id === editingId) ?? null : null;
+
+  function clearDraft() {
+    setEditingId(null);
+    setCreating(false);
+    setDraftTitle('');
+    setDraftBody('');
+    setDraftMood('Reflecting');
+  }
+
+  async function createVault() {
+    setError(''); setNotice('');
+    if (passphrase.length < 10) { setError('Use a journal passphrase with at least 10 characters. A memorable sentence works well.'); return; }
+    if (passphrase !== confirmPassphrase) { setError('The two passphrases do not match.'); return; }
+    setBusy(true);
+    try {
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const key = await deriveJournalKey(passphrase, salt, JOURNAL_KDF_ITERATIONS);
+      const envelope = await encryptJournalEntries([], key, salt, JOURNAL_KDF_ITERATIONS);
+      localStorage.setItem(storageKey, JSON.stringify(envelope));
+      setVault(envelope); setJournalKey(key); setEntries([]); setUnlocked(true);
+      setPassphrase(''); setConfirmPassphrase(''); setVaultLoadError('');
+      setNotice('Your private journal is ready on this device.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not create your encrypted journal.');
+    } finally { setBusy(false); }
+  }
+
+  async function unlockVault() {
+    setError(''); setNotice('');
+    if (!vault) return;
+    if (!passphrase) { setError('Enter your journal passphrase.'); return; }
+    setBusy(true);
+    try {
+      const salt = journalBase64ToBytes(vault.salt);
+      const key = await deriveJournalKey(passphrase, salt, vault.iterations || JOURNAL_KDF_ITERATIONS);
+      const decrypted = await decryptJournalEntries(vault, key);
+      setJournalKey(key); setEntries(decrypted); setUnlocked(true); setPassphrase(''); setVaultLoadError('');
+    } catch {
+      setError('That passphrase did not unlock this journal. Your saved entries have not been changed.');
+    } finally { setBusy(false); }
+  }
+
+  async function persistEntries(nextEntries: JournalEntry[]) {
+    if (!journalKey || !vault) throw new Error('Unlock your journal again before saving.');
+    const salt = journalBase64ToBytes(vault.salt);
+    const nextVault = await encryptJournalEntries(nextEntries, journalKey, salt, vault.iterations || JOURNAL_KDF_ITERATIONS);
+    localStorage.setItem(storageKey, JSON.stringify(nextVault));
+    setVault(nextVault);
+    setEntries(nextEntries);
+  }
+
+  function startNewEntry() {
+    setError(''); setNotice(''); setEditingId(null); setCreating(true);
+    setDraftTitle(''); setDraftBody(''); setDraftMood('Reflecting');
+  }
+
+  function openEntry(entry: JournalEntry) {
+    setError(''); setNotice(''); setCreating(false); setEditingId(entry.id);
+    setDraftTitle(entry.title); setDraftBody(entry.body); setDraftMood(entry.mood);
+  }
+
+  async function saveEntry() {
+    const body = draftBody.trim();
+    if (!body) { setError('Write something in your entry before saving.'); return; }
+    if (!journalKey || !vault) { setError('Unlock your journal before saving.'); return; }
+    setBusy(true); setError(''); setNotice('');
+    try {
+      const now = new Date().toISOString();
+      const existing = editingId ? entries.find(entry => entry.id === editingId) : undefined;
+      const entry: JournalEntry = {
+        id: existing?.id ?? (crypto.randomUUID?.() || `entry-${Date.now()}-${Math.random().toString(16).slice(2)}`),
+        title: draftTitle.trim().slice(0, 90) || 'Untitled entry',
+        body,
+        mood: draftMood,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      };
+      const nextEntries = existing ? entries.map(item => item.id === entry.id ? entry : item) : [entry, ...entries];
+      await persistEntries(nextEntries);
+      setEditingId(entry.id); setCreating(false); setNotice('Entry encrypted and saved on this device.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not save this journal entry.');
+    } finally { setBusy(false); }
+  }
+
+  async function deleteEntry() {
+    if (!editingId || !journalKey || !vault) return;
+    if (!window.confirm('Delete this journal entry permanently from this device?')) return;
+    setBusy(true); setError(''); setNotice('');
+    try {
+      await persistEntries(entries.filter(entry => entry.id !== editingId));
+      clearDraft(); setNotice('Journal entry deleted.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not delete this entry.');
+    } finally { setBusy(false); }
+  }
+
+  function lockJournal() {
+    setUnlocked(false); setJournalKey(null); setEntries([]); setPassphrase(''); setConfirmPassphrase('');
+    clearDraft(); setSearch(''); setError(''); setNotice('Journal locked.');
+  }
+
+  function deleteVault() {
+    if (!window.confirm('This permanently deletes every encrypted journal entry on this device. This cannot be undone. Continue?')) return;
+    try { localStorage.removeItem(storageKey); } catch { /* handled by resetting this view */ }
+    setVault(null); setJournalKey(null); setEntries([]); setUnlocked(false); setPassphrase(''); setConfirmPassphrase('');
+    clearDraft(); setVaultLoadError(''); setError(''); setNotice('The local journal vault was deleted.');
+  }
+
+  const dateLabel = (value: string) => new Date(value).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+
+  if (!unlocked) {
+    return <div className="journal-page">
+      <section className="journal-lock-card panel">
+        <div className="journal-lock-icon" aria-hidden="true">🔐</div>
+        <span className="section-label">PRIVATE JOURNAL</span>
+        <h2>{vault ? 'Welcome back to your journal.' : 'A space that stays yours.'}</h2>
+        <p className="journal-lock-copy">Your entries are encrypted on this device before they are saved. They are not uploaded to Supabase or included in leaderboard data.</p>
+        {vaultLoadError && <div className="journal-message error">{vaultLoadError}</div>}
+        <div className="journal-lock-form">
+          <label className="field"><span>{vault ? 'Journal passphrase' : 'Create a journal passphrase'}</span><input type="password" value={passphrase} onChange={e=>setPassphrase(e.target.value)} autoComplete={vault ? 'current-password' : 'new-password'} onKeyDown={e=>{if(e.key==='Enter'&&!busy)void (vault?unlockVault():createVault())}} placeholder="At least 10 characters"/></label>
+          {!vault && <label className="field"><span>Confirm passphrase</span><input type="password" value={confirmPassphrase} onChange={e=>setConfirmPassphrase(e.target.value)} autoComplete="new-password" onKeyDown={e=>{if(e.key==='Enter'&&!busy)void createVault()}} placeholder="Enter it again"/></label>}
+          <button className="primary-btn" type="button" disabled={busy||Boolean(vaultLoadError)||!passphrase||(!vault&&!confirmPassphrase)} onClick={()=>void (vault?unlockVault():createVault())}>{busy ? 'Please wait…' : vault ? 'Unlock journal' : 'Create private journal'}</button>
+        </div>
+        <div className="journal-security-note"><strong>Important:</strong> Your passphrase is never stored. If you forget it, the encrypted entries cannot be recovered. Keep it somewhere safe. This journal is local to this Windows user profile and does not sync to other devices.</div>
+        {(vault || vaultLoadError) && <button type="button" className="journal-reset-link" onClick={deleteVault}>Delete this encrypted journal and start over</button>}
+      </section>
+    </div>;
+  }
+
+  return <div className="journal-page">
+    <section className="journal-hero panel">
+      <div className="journal-hero-copy"><span className="section-label">PRIVATE JOURNAL</span><h2>Your space. Your thoughts.</h2><p>Write things down, reflect on your day, and keep the entries private to this device.</p></div>
+      <div className="journal-hero-actions"><span className="journal-encrypted-pill">🔒 Encrypted on this device</span><button type="button" className="ghost-btn small" onClick={lockJournal}>Lock journal</button><button type="button" className="primary-btn" onClick={startNewEntry}>＋ New entry</button></div>
+    </section>
+    <div className="journal-workspace">
+      <aside className="journal-library panel">
+        <div className="journal-library-head"><div><span className="section-label">YOUR ENTRIES</span><strong>{entries.length} {entries.length===1?'entry':'entries'}</strong></div></div>
+        <input className="journal-search" value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search your entries…" aria-label="Search journal entries"/>
+        <div className="journal-entry-list">
+          {visibleEntries.length ? visibleEntries.map(entry=><button type="button" key={entry.id} className={`journal-entry-item ${editingId===entry.id?'selected':''}`} onClick={()=>openEntry(entry)}><span className="journal-entry-topline"><strong>{entry.title}</strong><small>{dateLabel(entry.updatedAt)}</small></span><span className="journal-entry-mood">{entry.mood}</span><span className="journal-entry-excerpt">{entry.body.replace(/\s+/g,' ').slice(0,105)}</span></button>) : <div className="journal-empty-list">{entries.length?'No entries match that search.':'No entries yet. Start with a thought, a win, or something you want to remember.'}</div>}
+        </div>
+      </aside>
+      <section className="journal-editor panel">
+        {(creating || selectedEntry) ? <>
+          <div className="journal-editor-head"><div><span className="section-label">{creating?'NEW ENTRY':'EDITING ENTRY'}</span><strong>{creating?'A fresh page':selectedEntry?.createdAt?`Created ${dateLabel(selectedEntry.createdAt)}`:'Journal entry'}</strong></div>{editingId&&<button type="button" className="journal-delete-btn" onClick={()=>void deleteEntry()} disabled={busy}>Delete entry</button>}</div>
+          <label className="field"><span>Title</span><input maxLength={90} value={draftTitle} onChange={e=>setDraftTitle(e.target.value)} placeholder="Give this entry a title…"/></label>
+          <label className="field journal-body-field"><span>What's on your mind?</span><textarea value={draftBody} onChange={e=>setDraftBody(e.target.value)} rows={13} placeholder="Start wherever you are. It doesn't need to be perfect…"/></label>
+          <div className="journal-editor-footer"><label className="field journal-mood-field"><span>Mood</span><select value={draftMood} onChange={e=>setDraftMood(e.target.value as JournalMood)}>{(['Reflecting','Grateful','Focused','Stressed','Hopeful','Other'] as JournalMood[]).map(mood=><option key={mood} value={mood}>{mood}</option>)}</select></label><button type="button" className="primary-btn" onClick={()=>void saveEntry()} disabled={busy||!draftBody.trim()}>{busy?'Encrypting…':'Save entry'}</button></div>
+        </> : <div className="journal-empty-editor"><div aria-hidden="true">✍️</div><h3>Your next page is waiting.</h3><p>Choose an entry on the left or start a new one. Your writing is encrypted before it is saved.</p><button type="button" className="primary-btn" onClick={startNewEntry}>Write an entry</button></div>}
+        {error&&<div className="journal-message error">{error}</div>}
+        {notice&&<div className="journal-message success">{notice}</div>}
+      </section>
+    </div>
+  </div>;
+}
+
+function CommandPalette({onClose,onGo,onStartFocus}:{onClose:()=>void;onGo:(v:View)=>void;onStartFocus:()=>void}){const actions:[string,View|'focus'][]=[['Open Overview','Overview'],['Open Focus','Focus'],['Open Insights','Insights'],['Open Control Center','Control'],['Open Wellbeing','Wellbeing'],['Open Challenges','Challenges'],['Open Season Track','Season'],['Open Rewards','Rewards'],['Open Leaderboard','Leaderboard'],['Open Journal','Journal'],['Open Settings','Settings'],['Start Focus now','focus']];return <div className="palette-backdrop" onClick={onClose}><div className="palette" onClick={e=>e.stopPropagation()}><div className="palette-input"><span>⌕</span><input autoFocus placeholder="Jump to a feature…"/></div>{actions.map(([label,target])=><button key={label} onClick={()=>target==='focus'?onStartFocus():onGo(target)}><span>{label}</span><kbd>↵</kbd></button>)}</div></div>;}
 function ClosePrompt({onDismiss,onBackground,onQuit}:{onDismiss:()=>void;onBackground:()=>Promise<void>;onQuit:()=>Promise<void>}){
   return <div className="modal-backdrop">
     <div className="close-card" role="dialog" aria-modal="true" aria-labelledby="close-prompt-title">

@@ -1,6 +1,6 @@
 [package]
 name = "digital-balance"
-version = "1.4.4"
+version = "1.6.0"
 description = "Liba Bilancia Windows productivity app"
 authors = ["Liba Bilancia"]
 edition = "2021"
@@ -30,3 +30,4 @@ windows = { version = "0.61", features = [
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_UI_Accessibility"
 ] }
+

@@ -47,6 +47,26 @@ export async function signInWithEmailPassword(email: string, password: string) {
   if (error) throw error;
 }
 
+export async function signUpWithEmailPassword(email: string, password: string) {
+  if (!supabase) throw new Error('Supabase is not configured yet.');
+  const cleanEmail = email.trim();
+  if (!cleanEmail || !password) throw new Error('Enter your email and password.');
+  if (password.length < 8) throw new Error('Use a password with at least 8 characters.');
+  const { data, error } = await supabase.auth.signUp({ email: cleanEmail, password });
+  if (error) throw error;
+  return data;
+}
+
+export async function resetPasswordForEmail(email: string) {
+  if (!supabase) throw new Error('Supabase is not configured yet.');
+  const cleanEmail = email.trim();
+  if (!cleanEmail) throw new Error('Enter your email first.');
+  const { error } = await supabase.auth.resetPasswordForEmail(cleanEmail, {
+    redirectTo: 'digitalbalance://auth/callback',
+  });
+  if (error) throw error;
+}
+
 export async function updatePassword(password: string) {
   if (!supabase) throw new Error('Supabase is not configured yet.');
   if (password.length < 8) throw new Error('Use a password with at least 8 characters.');
@@ -104,6 +124,8 @@ export type Profile = {
   streak?: number;
   created_at?: string;
   updated_at?: string;
+  avatar_path?: string | null;
+  avatar_url?: string | null;
 };
 
 export async function ensureProfile(user: User) {
@@ -125,17 +147,66 @@ export async function ensureProfile(user: User) {
   if (error) throw error;
 }
 
+async function signedAvatarUrl(path: string | null | undefined) {
+  if (!supabase || !path) return null;
+  const { data, error } = await supabase.storage
+    .from('profile-pictures')
+    .createSignedUrl(path, 60 * 60 * 24);
+  if (error) throw error;
+  return data?.signedUrl ?? null;
+}
+
 export async function getCurrentProfile(): Promise<Profile | null> {
   if (!supabase) return null;
   const { data: auth } = await supabase.auth.getUser();
   if (!auth.user) return null;
   const { data, error } = await supabase
     .from('profiles')
-    .select('id, username, display_name, points, streak, created_at, updated_at')
+    .select('id, username, display_name, points, streak, created_at, updated_at, avatar_path')
     .eq('id', auth.user.id)
     .maybeSingle();
   if (error) throw error;
-  return data as Profile | null;
+  if (!data) return null;
+  return { ...data, avatar_url: await signedAvatarUrl(data.avatar_path) } as Profile;
+}
+
+export async function uploadProfileAvatar(blob: Blob) {
+  if (!supabase) throw new Error('Supabase is not configured yet.');
+  const { data: auth } = await supabase.auth.getUser();
+  if (!auth.user) throw new Error('You are not signed in.');
+  if (blob.size > 5 * 1024 * 1024) throw new Error('That image is still too large. Please choose a smaller picture.');
+
+  const path = `${auth.user.id}/avatar.webp`;
+  const { error: uploadError } = await supabase.storage
+    .from('profile-pictures')
+    .upload(path, blob, {
+      cacheControl: '86400',
+      contentType: 'image/webp',
+      upsert: true,
+    });
+  if (uploadError) throw uploadError;
+
+  const { error: profileError } = await supabase
+    .from('profiles')
+    .update({ avatar_path: path, updated_at: new Date().toISOString() })
+    .eq('id', auth.user.id);
+  if (profileError) throw profileError;
+
+  return await signedAvatarUrl(path);
+}
+
+export async function removeProfileAvatar() {
+  if (!supabase) throw new Error('Supabase is not configured yet.');
+  const { data: auth } = await supabase.auth.getUser();
+  if (!auth.user) throw new Error('You are not signed in.');
+  const path = `${auth.user.id}/avatar.webp`;
+  const { error: storageError } = await supabase.storage.from('profile-pictures').remove([path]);
+  if (storageError) throw storageError;
+  const { error: profileError } = await supabase
+    .from('profiles')
+    .update({ avatar_path: null, updated_at: new Date().toISOString() })
+    .eq('id', auth.user.id);
+  if (profileError) throw profileError;
 }
 
 export async function isUsernameAvailable(username: string) {
@@ -183,6 +254,52 @@ export async function updateProfileUsername(username: string) {
 }
 
 
+export const CURRENT_SEASON_ID = 'season-01-first-light';
+export const CURRENT_SEASON_GOAL = 5000;
+
+async function recordSeasonPoints(points: number) {
+  if (!supabase || !Number.isFinite(points) || points <= 0) return;
+  const { error } = await supabase.rpc('record_season_points', {
+    p_season_id: CURRENT_SEASON_ID,
+    p_points: Math.round(points),
+  });
+  if (error) {
+    // Seasonal tracking must never block the existing verified points reward.
+    console.warn('Could not record Season Points. Apply the Season 01 SQL setup:', error);
+  }
+}
+
+export type SeasonProgress = { points: number; rewardClaimed: boolean };
+export async function fetchCurrentSeasonProgress(): Promise<SeasonProgress> {
+  if (!supabase) return { points: 0, rewardClaimed: false };
+  const { data: auth, error: authError } = await supabase.auth.getUser();
+  if (authError) throw authError;
+  if (!auth.user) return { points: 0, rewardClaimed: false };
+  const { data, error } = await supabase
+    .from('season_progress')
+    .select('season_points, reward_claimed')
+    .eq('user_id', auth.user.id)
+    .eq('season_id', CURRENT_SEASON_ID)
+    .maybeSingle();
+  if (error) throw error;
+  return {
+    points: Number(data?.season_points ?? 0),
+    rewardClaimed: Boolean(data?.reward_claimed),
+  };
+}
+
+export async function claimCurrentSeasonReward(): Promise<{ claimed: boolean; alreadyClaimed: boolean; coins: number }> {
+  if (!supabase) throw new Error('Supabase is not configured yet.');
+  const { data, error } = await supabase.rpc('claim_season_reward', { p_season_id: CURRENT_SEASON_ID });
+  if (error) throw error;
+  const result = (data ?? {}) as Record<string, unknown>;
+  return {
+    claimed: Boolean(result.claimed),
+    alreadyClaimed: Boolean(result.already_claimed),
+    coins: Number(result.coins ?? 0),
+  };
+}
+
 export type ActivityRewardResult = { points: number; coins: number; claimed: boolean };
 
 export async function claimActivityReward(action: 'daily_checkin' | 'daily_focus_goal' | 'three_focus_sessions' | 'weekly_consistency'): Promise<ActivityRewardResult> {
@@ -190,11 +307,13 @@ export async function claimActivityReward(action: 'daily_checkin' | 'daily_focus
   const { data, error } = await supabase.rpc('claim_activity_reward', { p_action: action });
   if (error) throw error;
   const row = (data ?? {}) as Record<string, unknown>;
-  return {
+  const result = {
     points: Number(row.points ?? 0),
     coins: Number(row.coins ?? 0),
     claimed: Boolean(row.claimed),
   };
+  if (result.claimed && result.points > 0) await recordSeasonPoints(result.points);
+  return result;
 }
 
 export async function updateProfileDisplayName(displayName: string) {
@@ -214,16 +333,42 @@ export async function fetchLeaderboard() {
   if (!supabase) return [];
   const { data, error } = await supabase
     .from('profiles')
-    .select('user_id:id, display_name, total_points:points, created_at')
+    .select('user_id:id, display_name, total_points:points, created_at, avatar_path')
     .order('points', { ascending: false })
     .limit(50);
   if (error) throw error;
-  return data ?? [];
+
+  return await Promise.all((data ?? []).map(async (row) => ({
+    ...row,
+    avatar_url: await signedAvatarUrl(row.avatar_path),
+  })));
 }
 
 export async function awardFocusPoints(minutes: number) {
   if (!supabase) return { points: 0 };
   const { data, error } = await supabase.rpc('award_focus_points', { p_minutes: Math.round(minutes) });
   if (error) throw error;
-  return { points: Number(data ?? 0) };
+  const points = Number(data ?? 0);
+  await recordSeasonPoints(points);
+  return { points };
+}
+
+
+export type FeedbackCategory = 'bug' | 'concern' | 'suggestion' | 'general';
+
+export async function submitFeedback(category: FeedbackCategory, message: string) {
+  if (!supabase) throw new Error('Supabase is not configured yet.');
+  const clean = message.trim();
+  if (clean.length < 5) throw new Error('Please write a little more so the feedback is useful.');
+  if (clean.length > 2000) throw new Error('Feedback must be 2000 characters or fewer.');
+  const allowed: FeedbackCategory[] = ['bug', 'concern', 'suggestion', 'general'];
+  if (!allowed.includes(category)) throw new Error('Choose a valid feedback type.');
+
+  const { data, error } = await supabase.functions.invoke('submit-feedback', {
+    body: { category, message: clean },
+  });
+
+  if (error) throw error;
+  if (!data?.ok) throw new Error('Feedback could not be submitted.');
+  return data;
 }
